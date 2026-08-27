@@ -9,7 +9,7 @@ import matplotlib.patches as patches
 
 def load_img(path,input_size):
 
-    img = Image.open(path)
+    img = Image.open(path).convert("RGB")
 
     resize = Resize(input_size)
     img = resize(img)   
@@ -21,7 +21,111 @@ def load_img(path,input_size):
 
 
 
+def generate_masks(N, s, p1, input_size):
 
+    # Tamanho de cada célula da grade
+    cell_size = np.ceil(
+        np.array(input_size) / s
+    ).astype(int)
+
+    # Tamanho necessário para fazer o upsampling
+    up_size = (
+        (s + 1) * cell_size
+    )
+
+    # ---------------------------------------------
+    # 1. Gerar grades aleatórias
+    # ---------------------------------------------
+
+    grid = (
+        np.random.rand(N, s, s) < p1
+    ).astype(np.float32)
+
+    # ---------------------------------------------
+    # 2. Espaço para as máscaras finais
+    # ---------------------------------------------
+
+    masks = np.empty(
+        (N, *input_size),
+        dtype=np.float32
+    )
+
+    # ---------------------------------------------
+    # 3. Upsampling + deslocamento aleatório
+    # ---------------------------------------------
+
+    for i in tqdm(
+        range(N),
+        desc="Generating masks"
+    ):
+
+        # Deslocamento aleatório
+        x = np.random.randint(
+            0,
+            cell_size[0]
+        )
+
+        y = np.random.randint(
+            0,
+            cell_size[1]
+        )
+
+        # Upsampling da grade
+        upsampled = resize(
+            grid[i],
+            up_size,
+            order=1,
+            mode="reflect",
+            anti_aliasing=False
+        )
+
+        # Crop para o tamanho da imagem
+        masks[i] = upsampled[
+            x:x + input_size[0],
+            y:y + input_size[1]
+        ]
+
+    # ---------------------------------------------
+    # 4. Adicionar dimensão de canal
+    # ---------------------------------------------
+
+    masks = masks.reshape(
+        N,
+        1,
+        *input_size
+    )
+
+    return masks
+
+def detection_similarity(target, proposal):
+
+    # Bounding box da detecção original
+    target_box = target[:4]
+
+    # Bounding box da detecção após a máscara
+    proposal_box = proposal[:4]
+
+    # Similaridade espacial
+    iou = box_iou(
+        target_box,
+        proposal_box
+    )
+
+    # Confiança da detecção após a máscara
+    confidence = proposal[4]
+
+    # Como existe apenas uma classe,
+    # a similaridade entre classes é 1
+    class_similarity = 1.0
+
+    # Similaridade D-RISE
+    similarity = (
+        iou
+        * class_similarity
+        * confidence
+    )
+
+    return similarity
 
 
 
@@ -92,14 +196,8 @@ def explain(
             f"mas existem apenas "
             f"{len(original_detections)} detecções."
         )
-
-    # Detecção que queremos explicar
     target = original_detections[detection_index]
 
-    print("Detecção escolhida:")
-    print("Box:", target[:4])
-    print("Objectness:", target[4])
-    print("Class probability:", target[5])
 
 
     # ==================================================
@@ -191,35 +289,42 @@ def explain(
             saliency.max() - saliency.min()
         )
 
-    return saliency
+    return saliency,target
 
 
 
 
 
-def visualize_pipeline(inp, masks, saliency, num_masks=6):
-    """
-    Visualiza:
-    1. imagem original
-    2. algumas máscaras
-    3. imagens mascaradas
-    4. saliency map
-    """
+def visualize_pipeline(
+    inp,
+    masks,
+    saliency,
+    num_masks=6,
+    pipeline_path="pipeline.png",
+    masks_path="masks.png",
+    saliency_path="saliency_map.png"
+):
 
-    # ---------------------------------------------
+    # ==================================================
     # Imagem original
-    # ---------------------------------------------
+    # ==================================================
 
     original = inp[0].detach().cpu().numpy()
 
-    # (C,H,W) -> (H,W,C)
-    original = np.transpose(original, (1, 2, 0))
+    # (C, H, W) -> (H, W, C)
+    original = np.transpose(
+        original,
+        (1, 2, 0)
+    )
 
-    # ---------------------------------------------
-    # Selecionar algumas máscaras
-    # ---------------------------------------------
+    # ==================================================
+    # Selecionar máscaras
+    # ==================================================
 
-    num_masks = min(num_masks, masks.shape[0])
+    num_masks = min(
+        num_masks,
+        masks.shape[0]
+    )
 
     indices = np.linspace(
         0,
@@ -228,9 +333,13 @@ def visualize_pipeline(inp, masks, saliency, num_masks=6):
         dtype=int
     )
 
-    # ---------------------------------------------
-    # Criar figura
-    # ---------------------------------------------
+    # ==================================================
+    # 1. PIPELINE COMPLETO
+    #
+    # Linha 1: imagem original
+    # Linha 2: máscaras
+    # Linha 3: imagens mascaradas
+    # ==================================================
 
     fig, axes = plt.subplots(
         3,
@@ -241,28 +350,26 @@ def visualize_pipeline(inp, masks, saliency, num_masks=6):
     if num_masks == 1:
         axes = axes.reshape(3, 1)
 
-    # ---------------------------------------------
-    # Linha 1: imagem original
-    # ---------------------------------------------
+    # --------------------------------------------------
+    # Imagem original
+    # --------------------------------------------------
 
     for ax in axes[0]:
+
         ax.imshow(original)
         ax.axis("off")
 
-    axes[0, 0].set_title("Imagem original")
+    axes[0, 0].set_title(
+        "Imagem original"
+    )
 
-    # ---------------------------------------------
-    # Linha 2: máscaras
-    # ---------------------------------------------
+    # --------------------------------------------------
+    # Máscaras
+    # --------------------------------------------------
 
     for col, idx in enumerate(indices):
 
-        mask = masks[idx]
-
-        if hasattr(mask, "detach"):
-            mask = mask.detach().cpu().numpy()
-
-        mask = np.squeeze(mask)
+        mask = masks[idx, 0]
 
         axes[1, col].imshow(
             mask,
@@ -277,20 +384,17 @@ def visualize_pipeline(inp, masks, saliency, num_masks=6):
 
         axes[1, col].axis("off")
 
-    # ---------------------------------------------
-    # Linha 3: imagens mascaradas
-    # ---------------------------------------------
+    # --------------------------------------------------
+    # Imagens mascaradas
+    # --------------------------------------------------
 
     for col, idx in enumerate(indices):
 
-        mask = masks[idx]
+        mask = masks[idx, 0]
 
-        if hasattr(mask, "detach"):
-            mask = mask.detach().cpu().numpy()
-
-        mask = np.squeeze(mask)
-
-        masked_image = original * mask[..., None]
+        masked_image = (
+            original * mask[..., None]
+        )
 
         axes[2, col].imshow(
             masked_image
@@ -303,46 +407,125 @@ def visualize_pipeline(inp, masks, saliency, num_masks=6):
         axes[2, col].axis("off")
 
     plt.tight_layout()
-    plt.show()
 
-    # ---------------------------------------------
-    # Saliency map separado
-    # ---------------------------------------------
+    plt.savefig(
+        pipeline_path,
+        dpi=300,
+        bbox_inches="tight"
+    )
 
-    plt.figure(figsize=(8, 8))
+    plt.close(fig)
 
-    plt.imshow(
+    # ==================================================
+    # 2. SOMENTE AS MÁSCARAS
+    # ==================================================
+
+    fig, axes = plt.subplots(
+        1,
+        num_masks,
+        figsize=(3 * num_masks, 3)
+    )
+
+    if num_masks == 1:
+        axes = [axes]
+
+    for col, idx in enumerate(indices):
+
+        mask = masks[idx, 0]
+
+        axes[col].imshow(
+            mask,
+            cmap="gray",
+            vmin=0,
+            vmax=1
+        )
+
+        axes[col].set_title(
+            f"Máscara {idx}"
+        )
+
+        axes[col].axis("off")
+
+    plt.tight_layout()
+
+    plt.savefig(
+        masks_path,
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.close(fig)
+
+    # ==================================================
+    # 3. SALIENCY MAP
+    # ==================================================
+
+    fig, ax = plt.subplots(
+        figsize=(8, 8)
+    )
+
+    ax.imshow(
         original,
         alpha=0.5
     )
 
-    plt.imshow(
+    im = ax.imshow(
         saliency,
         cmap="jet",
         alpha=0.5
     )
 
-    plt.title("D-RISE Saliency Map")
-    plt.axis("off")
-    plt.colorbar()
+    ax.set_title(
+        "D-RISE Saliency Map"
+    )
 
-    plt.show()
+    ax.axis("off")
 
+    fig.colorbar(
+        im,
+        ax=ax
+    )
 
+    plt.tight_layout()
+
+    plt.savefig(
+        saliency_path,
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.close(fig)
 
 def visualize_detection_and_saliency(
     inp,
     saliency,
-    detection
+    detection,
+    save_path="detection_saliency.png"
 ):
 
-    image = inp[0].detach().cpu().numpy()
-    image = np.transpose(image, (1, 2, 0))
+    # ==================================================
+    # Imagem
+    # ==================================================
 
-    box = detection[:4]
+    image = inp[0].detach().cpu().numpy()
+
+    # (C, H, W) -> (H, W, C)
+    image = np.transpose(
+        image,
+        (1, 2, 0)
+    )
+
+    # ==================================================
+    # Dados da detecção
+    # ==================================================
+
+    x1, y1, x2, y2 = detection[:4]
+
     confidence = detection[4]
 
-    x1, y1, x2, y2 = box
+    # ==================================================
+    # Criar figura
+    # ==================================================
 
     fig, axes = plt.subplots(
         1,
@@ -350,7 +533,10 @@ def visualize_detection_and_saliency(
         figsize=(12, 6)
     )
 
-    # Imagem original
+    # ==================================================
+    # 1. Imagem original + bounding box
+    # ==================================================
+
     axes[0].imshow(image)
 
     rect = patches.Rectangle(
@@ -364,15 +550,21 @@ def visualize_detection_and_saliency(
     axes[0].add_patch(rect)
 
     axes[0].set_title(
-        f"Detecção — conf. {confidence:.2f}"
+        f"Detecção — Confidence: {confidence:.3f}"
     )
 
     axes[0].axis("off")
 
-    # Saliency
-    axes[1].imshow(image, alpha=0.5)
+    # ==================================================
+    # 2. Imagem + Saliency Map
+    # ==================================================
 
     axes[1].imshow(
+        image,
+        alpha=0.5
+    )
+
+    im = axes[1].imshow(
         saliency,
         cmap="jet",
         alpha=0.6
@@ -394,5 +586,144 @@ def visualize_detection_and_saliency(
 
     axes[1].axis("off")
 
+    # Colorbar
+    fig.colorbar(
+        im,
+        ax=axes[1]
+    )
+
+    # ==================================================
+    # Salvar
+    # ==================================================
+
     plt.tight_layout()
-    plt.show()
+
+    plt.savefig(
+        save_path,
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.close(fig)
+
+
+
+def xai_box_iou(saliency, detection, percentile=80):
+
+    # Bounding box
+    x1, y1, x2, y2 = detection[:4]
+
+    x1 = int(round(x1))
+    y1 = int(round(y1))
+    x2 = int(round(x2))
+    y2 = int(round(y2))
+
+    # Máscara da bounding box
+    box_mask = np.zeros(
+        saliency.shape,
+        dtype=bool
+    )
+
+    box_mask[y1:y2, x1:x2] = True
+
+    # Máscara XAI
+    threshold = np.percentile(
+        saliency,
+        percentile
+    )
+
+    xai_mask = saliency >= threshold
+
+    # Interseção
+    intersection = np.logical_and(
+        xai_mask,
+        box_mask
+    ).sum()
+
+    # União
+    union = np.logical_or(
+        xai_mask,
+        box_mask
+    ).sum()
+
+    # IoU
+    if union == 0:
+        return 0.0
+
+    return intersection / union
+
+
+def visualize_xai_iou(
+    inp,
+    saliency,
+    detection,
+    percentile=80,
+    save_path="xai_iou.png"
+):
+
+    image = inp[0].detach().cpu().numpy()
+    image = np.transpose(image, (1, 2, 0))
+
+    x1, y1, x2, y2 = detection[:4]
+
+    x1 = int(round(x1))
+    y1 = int(round(y1))
+    x2 = int(round(x2))
+    y2 = int(round(y2))
+
+    # Máscara XAI
+    threshold = np.percentile(
+        saliency,
+        percentile
+    )
+
+    xai_mask = saliency >= threshold
+
+    iou = xai_box_iou(
+        saliency,
+        detection,
+        percentile
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(8, 8)
+    )
+
+    ax.imshow(image)
+
+    # Mostrar somente regiões XAI
+    ax.imshow(
+        np.ma.masked_where(
+            ~xai_mask,
+            saliency
+        ),
+        cmap="jet",
+        alpha=0.6
+    )
+
+    # Bounding box
+    rect = patches.Rectangle(
+        (x1, y1),
+        x2 - x1,
+        y2 - y1,
+        fill=False,
+        linewidth=2
+    )
+
+    ax.add_patch(rect)
+
+    ax.set_title(
+        f"XAI × Bounding Box | IoU = {iou:.4f}"
+    )
+
+    ax.axis("off")
+
+    plt.tight_layout()
+
+    plt.savefig(
+        save_path,
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.close(fig)

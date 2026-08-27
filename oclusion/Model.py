@@ -31,25 +31,16 @@ class Model:
 
             if boxes is None or len(boxes) == 0:
                 predictions.append(
-                    np.empty((0, 6), dtype=np.float32)
+                    np.empty((0, 5), dtype=np.float32)
                 )
                 continue
 
             xyxy = boxes.xyxy.cpu().numpy()
             conf = boxes.conf.cpu().numpy()
 
-            # Para uma única classe:
-            #
-            # [x1, y1, x2, y2, objectness/confidence, class_probability]
-            #
-            # A Ultralytics fornece a confiança final da detecção.
-            #
-            class_probability = conf.copy()
-
             detections = np.column_stack([
                 xyxy,
-                conf,
-                class_probability
+                conf
             ])
 
             predictions.append(detections)
