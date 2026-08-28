@@ -1,182 +1,431 @@
+import cv2
 import numpy as np
 import torch
-import cv2
-import matplotlib.pyplot as plt
+import YOLOv8_Explainer
 
 
-def calculate_box_iou(box1, box2):
+# =========================================================
+# Grad-CAM
+# =========================================================
+
+def get_gradcam_map(model_cam, image_path):
     """
-    Calcula IoU entre duas bounding boxes.
+    Gera e retorna o mapa Grad-CAM numérico.
 
-    Formato:
-        [x1, y1, x2, y2]
+    Utiliza exatamente o mesmo pré-processamento
+    empregado pelo YOLOv8_Explainer.
     """
 
-    x1 = max(box1[0], box2[0])
-    y1 = max(box1[1], box2[1])
+    img = cv2.imread(image_path)
 
-    x2 = min(box1[2], box2[2])
-    y2 = min(box1[3], box2[3])
+    if img is None:
+        raise ValueError(
+            f"Não foi possível carregar a imagem: {image_path}"
+        )
 
-    intersection_width = max(
-        0.0,
-        x2 - x1
+    # Mesmo pré-processamento do YOLOv8_Explainer
+    img = YOLOv8_Explainer.letterbox(img)[0]
+
+    img = cv2.cvtColor(
+        img,
+        cv2.COLOR_BGR2RGB
     )
 
-    intersection_height = max(
-        0.0,
-        y2 - y1
+    img = np.float32(img) / 255.0
+
+    # HWC -> CHW
+    tensor = (
+        torch.from_numpy(
+            np.transpose(
+                img,
+                axes=[2, 0, 1]
+            )
+        )
+        .unsqueeze(0)
+        .to(model_cam.device)
     )
 
-    intersection = (
-        intersection_width *
-        intersection_height
+    # Grad-CAM
+    grayscale_cam = model_cam.method(
+        tensor,
+        [model_cam.target]
     )
 
-    area1 = (
-        max(0.0, box1[2] - box1[0]) *
-        max(0.0, box1[3] - box1[1])
-    )
+    # Remover dimensão do batch
+    grayscale_cam = grayscale_cam[0, :]
 
-    area2 = (
-        max(0.0, box2[2] - box2[0]) *
-        max(0.0, box2[3] - box2[1])
-    )
-
-    union = (
-        area1 +
-        area2 -
-        intersection
-    )
-
-    if union <= 0:
-        return 0.0
-
-    return intersection / union
+    return grayscale_cam
 
 
-def get_target_detection(
+# =========================================================
+# Detecções
+# =========================================================
+
+def get_detections(
+    image_path,
     model,
-    image_tensor,
-    detection_index=0,
-    imgsz=(960, 960),
-    conf=0.001
+    input_size=960,
+    conf_threshold=0.4
 ):
     """
-    Obtém a detecção original utilizada como alvo.
+    Executa o YOLO e retorna todas as detecções.
 
-    Retorna:
-
-        target = [x1, y1, x2, y2, confidence]
+    Formato:
+        [x1, y1, x2, y2, confidence, class_id]
     """
 
-    predictions = model.predict(
-        source=image_tensor,
-        imgsz=imgsz,
-        conf=conf,
+    results = model.predict(
+        source=image_path,
+        imgsz=input_size,
+        conf=conf_threshold,
         verbose=False
     )
 
-    boxes = predictions[0].boxes
+    boxes = results[0].boxes
 
     if boxes is None or len(boxes) == 0:
-        raise ValueError(
-            "Nenhuma detecção encontrada."
-        )
-
-    if detection_index >= len(boxes):
-        raise ValueError(
-            f"detection_index={detection_index}, "
-            f"mas existem apenas "
-            f"{len(boxes)} detecções."
+        return np.empty(
+            (0, 6),
+            dtype=np.float32
         )
 
     xyxy = (
-        boxes.xyxy[detection_index]
+        boxes.xyxy
         .detach()
         .cpu()
         .numpy()
     )
 
     confidence = (
-        boxes.conf[detection_index]
+        boxes.conf
         .detach()
         .cpu()
-        .item()
+        .numpy()
+        .reshape(-1, 1)
     )
 
-    target = np.concatenate([
-        xyxy,
-        [confidence]
-    ])
+    class_id = (
+        boxes.cls
+        .detach()
+        .cpu()
+        .numpy()
+        .reshape(-1, 1)
+    )
 
-    return target
+    detections = np.concatenate(
+        [
+            xyxy,
+            confidence,
+            class_id
+        ],
+        axis=1
+    )
+
+    return detections
 
 
-def get_detection_confidence(
-    model,
-    image_tensor,
-    target_box,
-    iou_threshold=0.5,
-    imgsz=(960, 960),
-    conf=0.001
+# =========================================================
+# EBPG individual
+# =========================================================
+
+def calculate_ebpg(
+    saliency,
+    bbox
 ):
     """
-    Executa o YOLO na imagem modificada e procura
-    a detecção que melhor corresponde à bounding box
-    original.
+    Calcula o Energy-Based Pointing Game (EBPG).
 
-    Retorna:
+    EBPG =
+        energia dentro da bounding box /
+        energia total do mapa Grad-CAM
 
-        confidence
-        best_iou
+    Parâmetros
+    ----------
+    saliency : np.ndarray
+        Mapa Grad-CAM 2D.
+
+    bbox : array-like
+        Bounding box [x1, y1, x2, y2].
+
+    Retorno
+    -------
+    float
+        EBPG entre 0 e 1.
     """
 
-    predictions = model.predict(
-        source=image_tensor,
-        imgsz=imgsz,
-        conf=conf,
-        verbose=False
+    saliency = np.asarray(
+        saliency,
+        dtype=np.float32
     )
 
-    boxes = predictions[0].boxes
-
-    if boxes is None or len(boxes) == 0:
-        return 0.0, 0.0
-
-    target = target_box[:4]
-
-    best_iou = 0.0
-    best_confidence = 0.0
-
-    for i in range(len(boxes)):
-
-        box = (
-            boxes.xyxy[i]
-            .detach()
-            .cpu()
-            .numpy()
+    if saliency.ndim != 2:
+        raise ValueError(
+            "O mapa Grad-CAM deve ser 2D."
         )
 
-        confidence = (
-            boxes.conf[i]
-            .detach()
-            .cpu()
-            .item()
+    # Grad-CAM deve representar energia positiva
+    saliency = np.maximum(
+        saliency,
+        0
+    )
+
+    total_energy = np.sum(
+        saliency
+    )
+
+    if total_energy <= 0:
+        return 0.0
+
+    height, width = saliency.shape
+
+    x1, y1, x2, y2 = bbox
+
+    # Converter para coordenadas válidas
+    x1 = int(np.floor(x1))
+    y1 = int(np.floor(y1))
+    x2 = int(np.ceil(x2))
+    y2 = int(np.ceil(y2))
+
+    x1 = max(
+        0,
+        min(x1, width)
+    )
+
+    x2 = max(
+        0,
+        min(x2, width)
+    )
+
+    y1 = max(
+        0,
+        min(y1, height)
+    )
+
+    y2 = max(
+        0,
+        min(y2, height)
+    )
+
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+
+    # Energia dentro da bounding box
+    bbox_energy = np.sum(
+        saliency[
+            y1:y2,
+            x1:x2
+        ]
+    )
+
+    ebpg = (
+        bbox_energy /
+        total_energy
+    )
+
+    return float(ebpg)
+
+
+# =========================================================
+# EBPG para todas as caixas
+# =========================================================
+
+def calculate_ebpg_all_boxes(
+    saliency,
+    detections
+):
+    """
+    Calcula EBPG para todas as bounding boxes.
+
+    O mesmo mapa Grad-CAM é utilizado para todas
+    as detecções.
+
+    Retorna uma lista de dicionários.
+    """
+
+    results = []
+
+    for i, detection in enumerate(
+        detections
+    ):
+
+        bbox = detection[:4]
+
+        confidence = float(
+            detection[4]
         )
 
-        iou = calculate_box_iou(
-            target,
-            box
+        class_id = int(
+            detection[5]
         )
 
-        if iou > best_iou:
+        ebpg = calculate_ebpg(
+            saliency,
+            bbox
+        )
 
-            best_iou = iou
-            best_confidence = confidence
+        results.append(
+            {
+                "detection_index": i,
+                "bbox": bbox,
+                "confidence": confidence,
+                "class_id": class_id,
+                "ebpg": ebpg
+            }
+        )
 
-    if best_iou < iou_threshold:
+    return results
 
-        return 0.0, best_iou
 
-    return best_confidence, best_iou
+# =========================================================
+# Estatísticas
+# =========================================================
+
+def calculate_ebpg_statistics(
+    ebpg_results
+):
+    """
+    Calcula média e desvio-padrão dos EBPGs.
+    """
+
+    if len(ebpg_results) == 0:
+        return {
+            "mean": 0.0,
+            "std": 0.0,
+            "n": 0
+        }
+
+    values = np.array(
+        [
+            result["ebpg"]
+            for result in ebpg_results
+        ],
+        dtype=np.float32
+    )
+
+    mean = float(
+        np.mean(values)
+    )
+
+    if len(values) > 1:
+        std = float(
+            np.std(
+                values,
+                ddof=1
+            )
+        )
+    else:
+        std = 0.0
+
+    return {
+        "mean": mean,
+        "std": std,
+        "n": len(values)
+    }
+
+
+# =========================================================
+# Visualização opcional
+# =========================================================
+
+def visualize_ebpg(
+    image_path,
+    saliency,
+    detections,
+    save_path="ebpg_result.png"
+):
+    """
+    Visualiza o Grad-CAM e todas as bounding boxes,
+    mostrando o EBPG de cada detecção.
+    """
+
+    import matplotlib.pyplot as plt
+
+    image = cv2.imread(
+        image_path
+    )
+
+    if image is None:
+        raise ValueError(
+            f"Não foi possível carregar: {image_path}"
+        )
+
+    image = cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2RGB
+    )
+
+    # Redimensionar CAM para o tamanho da imagem
+    saliency_resized = cv2.resize(
+        saliency,
+        (
+            image.shape[1],
+            image.shape[0]
+        )
+    )
+
+    # Normalização para visualização
+    saliency_resized = (
+        saliency_resized -
+        saliency_resized.min()
+    )
+
+    max_value = saliency_resized.max()
+
+    if max_value > 0:
+        saliency_resized /= max_value
+
+    plt.figure(
+        figsize=(10, 8)
+    )
+
+    plt.imshow(image)
+
+    plt.imshow(
+        saliency_resized,
+        alpha=0.5,
+        cmap="jet"
+    )
+
+    for i, detection in enumerate(
+        detections
+    ):
+
+        bbox = detection[:4]
+
+        ebpg = calculate_ebpg(
+            saliency,
+            bbox
+        )
+
+        x1, y1, x2, y2 = bbox
+
+        plt.plot(
+            [x1, x2, x2, x1, x1],
+            [y1, y1, y2, y2, y1],
+            linewidth=2
+        )
+
+        plt.text(
+            x1,
+            y1,
+            f"#{i} EBPG={ebpg:.3f}",
+            fontsize=10,
+            bbox=dict(
+                facecolor="white",
+                alpha=0.7
+            )
+        )
+
+    plt.axis("off")
+
+    plt.tight_layout()
+
+    plt.savefig(
+        save_path,
+        dpi=300,
+        bbox_inches="tight"
+    )
+
+    plt.show()
+
+    plt.close()

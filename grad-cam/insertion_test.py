@@ -1,4 +1,4 @@
-def deletion_test(
+def insertion_test(
     model,
     inp,
     saliency,
@@ -9,60 +9,63 @@ def deletion_test(
     baseline_value=0.0
 ):
     """
-    Deletion Test para Grad-CAM.
+    Insertion Test para Grad-CAM.
 
-    Remove progressivamente as regiões mais importantes
+    Começa com uma imagem baseline e adiciona
+    progressivamente as regiões mais importantes
     indicadas pelo mapa Grad-CAM.
 
     Parâmetros
     ----------
     model:
-        Objeto yolov8_heatmap.
+        Objeto contendo o modelo YOLO.
 
     inp:
         Tensor da imagem original.
-        Formato esperado: [1, 3, H, W].
+        Formato:
+            [1, 3, H, W]
 
     saliency:
         Mapa Grad-CAM.
-        Formato esperado: [H, W].
+        Formato:
+            [H, W]
 
     target:
         Detecção original:
-        [x1, y1, x2, y2, confidence]
+            [x1, y1, x2, y2, confidence]
 
     grid_size:
         Número de regiões por dimensão.
+
         Exemplo:
             16 -> 16x16 = 256 regiões.
 
     steps:
-        Número de etapas do Deletion Test.
+        Número de etapas do experimento.
 
     iou_threshold:
         IoU mínimo para considerar que a detecção
         encontrada corresponde à detecção original.
 
     baseline_value:
-        Valor utilizado para apagar as regiões.
-        Para tensor normalizado [0,1]:
+        Valor inicial das regiões.
+
+        Para imagem normalizada [0,1]:
             0.0 = preto.
 
     Retorna
     -------
     fractions:
-        Fração das regiões removidas.
+        Fração da imagem original inserida.
 
     confidences:
-        Confiança da detecção correspondente
-        em cada etapa.
+        Confiança da detecção correspondente.
 
     ious:
-        IoU da detecção encontrada em relação à
-        bounding box original.
+        IoU da detecção encontrada com a detecção original.
 
     auc:
-        Área sob a curva de Deletion.
+        Área sob a curva de Insertion.
     """
 
     # =========================================================
@@ -77,7 +80,7 @@ def deletion_test(
 
     if inp.shape[0] != 1:
         raise ValueError(
-            "O Deletion Test atual espera uma única imagem."
+            "O Insertion Test atual espera uma única imagem."
         )
 
     if inp.shape[1] != 3:
@@ -93,7 +96,7 @@ def deletion_test(
         )
 
     # =========================================================
-    # 2. Normalizar mapa Grad-CAM
+    # 2. Normalizar Grad-CAM
     # =========================================================
 
     saliency = np.asarray(
@@ -136,7 +139,7 @@ def deletion_test(
         )
 
     # =========================================================
-    # 4. Criar regiões do mapa Grad-CAM
+    # 4. Criar regiões grid_size × grid_size
     # =========================================================
 
     regions = []
@@ -169,8 +172,10 @@ def deletion_test(
                 x1:x2
             ]
 
-            importance = float(region_saliency.sum()
-)
+            # Energia da região
+            importance = float(
+                region_saliency.sum()
+            )
 
             regions.append({
                 "x1": x1,
@@ -181,7 +186,7 @@ def deletion_test(
             })
 
     # =========================================================
-    # 5. Ordenar regiões pela importância
+    # 5. Ordenar regiões
     # =========================================================
 
     regions.sort(
@@ -204,49 +209,44 @@ def deletion_test(
     )
 
     # =========================================================
-    # 7. Valores iniciais
+    # 7. Imagem baseline
     # =========================================================
 
-    original_confidence = float(
-        target[4]
+    baseline = np.full_like(
+        original,
+        baseline_value
     )
 
-    fractions = [
-        0.0
-    ]
+    # =========================================================
+    # 8. Valores iniciais
+    # =========================================================
 
-    confidences = [
-        original_confidence
-    ]
-
-    ious = [
-        1.0
-    ]
+    fractions = []
+    confidences = []
+    ious = []
 
     # =========================================================
-    # 8. Deletion progressivo
+    # 9. Insertion progressivo
     # =========================================================
 
     for step in range(
-        1,
         steps + 1
     ):
 
         fraction = step / steps
 
-        # Número de regiões que serão removidas
         number_regions = int(
             fraction * total_regions
         )
 
         # ---------------------------------------------
-        # Criar cópia da imagem original
+        # Criar imagem a partir do baseline
         # ---------------------------------------------
 
-        modified = original.copy()
+        modified = baseline.copy()
 
         # ---------------------------------------------
-        # Remover as regiões mais importantes
+        # Inserir regiões mais importantes
         # ---------------------------------------------
 
         for region in regions[
@@ -262,23 +262,26 @@ def deletion_test(
                 :,
                 y1:y2,
                 x1:x2
-            ] = baseline_value
+            ] = original[
+                :,
+                y1:y2,
+                x1:x2
+            ]
 
         # =================================================
-        # 9. Converter para tensor
+        # 10. Converter para tensor
         # =================================================
 
         modified_tensor = torch.from_numpy(
             modified
         ).unsqueeze(0).float()
 
-        # Utilizar o mesmo device da imagem original
         modified_tensor = modified_tensor.to(
             inp.device
         )
 
         # =================================================
-        # 10. Executar YOLO
+        # 11. YOLO
         # =================================================
 
         confidence, best_iou = get_detection_confidence(
@@ -291,7 +294,7 @@ def deletion_test(
         )
 
         # =================================================
-        # 11. Armazenar resultados
+        # 12. Armazenar
         # =================================================
 
         fractions.append(
@@ -307,13 +310,13 @@ def deletion_test(
         )
 
         # =================================================
-        # 12. Mostrar progresso
+        # 13. Progresso
         # =================================================
 
         print(
-            f"Deletion "
+            f"Insertion "
             f"{fraction:6.1%} "
-            f"| regiões removidas: "
+            f"| regiões inseridas: "
             f"{number_regions:3d}/{total_regions} "
             f"| confidence: "
             f"{confidence:.4f} "
@@ -322,7 +325,7 @@ def deletion_test(
         )
 
     # =========================================================
-    # 13. Calcular AUC
+    # 14. Converter para numpy
     # =========================================================
 
     fractions = np.asarray(
@@ -340,19 +343,23 @@ def deletion_test(
         dtype=np.float32
     )
 
+    # =========================================================
+    # 15. AUC
+    # =========================================================
+
     auc = np.trapezoid(
         confidences,
         fractions
     )
 
-    # =========================================================
-    # 14. Resultado
-    # =========================================================
-
     print()
     print(
-        f"Deletion AUC: {auc:.6f}"
+        f"Insertion AUC: {auc:.6f}"
     )
+
+    # =========================================================
+    # 16. Retorno
+    # =========================================================
 
     return (
         fractions,
