@@ -170,35 +170,24 @@ def explain(
     model,
     inp,
     masks,
-    detection_index=0,
     batch_size=100
 ):
 
     N = masks.shape[0]
 
     # ==================================================
-    # 1. Obter as detecções da imagem ORIGINAL
+    # 1. Detecções da imagem original
     # ==================================================
 
     original_predictions = model.run_on_batch(inp)
-
     original_detections = original_predictions[0]
 
     if len(original_detections) == 0:
         raise ValueError(
-            "O modelo não encontrou nenhuma detecção "
-            "na imagem original."
+            "O modelo não encontrou nenhuma detecção."
         )
 
-    if detection_index >= len(original_detections):
-        raise ValueError(
-            f"detection_index={detection_index}, "
-            f"mas existem apenas "
-            f"{len(original_detections)} detecções."
-        )
-    target = original_detections[detection_index]
-
-
+    D = len(original_detections)
 
     # ==================================================
     # 2. Aplicar as máscaras
@@ -206,15 +195,23 @@ def explain(
 
     masked = inp * masks
 
-
     # ==================================================
-    # 3. Executar YOLO nas imagens mascaradas
+    # 3. Matriz de pesos
+    #
+    # D = número de detecções
+    # N = número de máscaras
+    #
+    # weights[d, m]
     # ==================================================
 
     weights = np.zeros(
-        N,
+        (D, N),
         dtype=np.float32
     )
+
+    # ==================================================
+    # 4. Executar YOLO nas imagens mascaradas
+    # ==================================================
 
     for i in tqdm(
         range(0, N, batch_size),
@@ -229,11 +226,9 @@ def explain(
             batch
         )
 
-
-        # ==============================================
-        # 4. Para cada máscara, encontrar a melhor
-        #    correspondência com a detecção original
-        # ==============================================
+        # ----------------------------------------------
+        # Cada imagem mascarada
+        # ----------------------------------------------
 
         for j, proposals in enumerate(
             batch_predictions
@@ -241,28 +236,41 @@ def explain(
 
             mask_index = i + j
 
-            # Nenhuma detecção após aplicar a máscara
             if len(proposals) == 0:
-                weights[mask_index] = 0
                 continue
 
-            best_similarity = 0.0
+            # ------------------------------------------
+            # Para cada detecção original
+            # ------------------------------------------
 
-            for proposal in proposals:
+            for detection_index, target in enumerate(
+                original_detections
+            ):
 
-                similarity = detection_similarity(
-                    target,
-                    proposal
-                )
+                best_similarity = 0.0
 
-                if similarity > best_similarity:
-                    best_similarity = similarity
+                # --------------------------------------
+                # Procurar a proposta que melhor
+                # corresponde àquela detecção
+                # --------------------------------------
 
-            weights[mask_index] = best_similarity
+                for proposal in proposals:
 
+                    similarity = detection_similarity(
+                        target,
+                        proposal
+                    )
+
+                    if similarity > best_similarity:
+                        best_similarity = similarity
+
+                weights[
+                    detection_index,
+                    mask_index
+                ] = best_similarity
 
     # ==================================================
-    # 5. Soma ponderada das máscaras
+    # 5. Gerar um mapa para cada detecção
     # ==================================================
 
     masks_flat = masks.reshape(
@@ -270,26 +278,44 @@ def explain(
         -1
     )
 
-    saliency = weights @ masks_flat
+    saliency_maps = []
 
-    saliency = saliency.reshape(
-        *model.input_size
-    )
+    for detection_index in range(D):
 
-
-    # ==================================================
-    # 6. Normalização
-    # ==================================================
-
-    if saliency.max() > saliency.min():
+        detection_weights = weights[
+            detection_index
+        ]
 
         saliency = (
-            saliency - saliency.min()
-        ) / (
-            saliency.max() - saliency.min()
+            detection_weights @ masks_flat
         )
 
-    return saliency,target
+        saliency = saliency.reshape(
+            *model.input_size
+        )
+
+        # ----------------------------------------------
+        # Normalização individual
+        # ----------------------------------------------
+
+        if saliency.max() > saliency.min():
+
+            saliency = (
+                saliency - saliency.min()
+            ) / (
+                saliency.max() - saliency.min()
+            )
+
+        saliency_maps.append(
+            saliency
+        )
+
+    saliency_maps = np.stack(
+        saliency_maps,
+        axis=0
+    )
+
+    return saliency_maps, original_detections
 
 
 
@@ -727,3 +753,263 @@ def visualize_xai_iou(
     )
 
     plt.close(fig)
+# =========================================================
+# EBPG
+# =========================================================
+
+def calculate_ebpg(
+    saliency,
+    detection
+):
+    """
+    Calcula o Energy-Based Pointing Game (EBPG)
+    para uma bounding box.
+
+    EBPG =
+        energia dentro da bounding box /
+        energia total do mapa de saliência
+
+    Parameters
+    ----------
+    saliency : np.ndarray
+        Mapa de saliência 2D.
+
+    detection : array-like
+        Detecção no formato:
+
+        [x1, y1, x2, y2, confidence]
+
+    Returns
+    -------
+    float
+        EBPG da detecção.
+    """
+
+    saliency = np.asarray(
+        saliency,
+        dtype=np.float32
+    )
+
+    if saliency.ndim != 2:
+        raise ValueError(
+            f"Saliency deve ser 2D. "
+            f"Recebido: {saliency.shape}"
+        )
+
+    # -----------------------------------------------------
+    # Garantir energia não negativa
+    # -----------------------------------------------------
+
+    saliency = np.maximum(
+        saliency,
+        0.0
+    )
+
+    # -----------------------------------------------------
+    # Energia total
+    # -----------------------------------------------------
+
+    total_energy = np.sum(
+        saliency
+    )
+
+    if total_energy <= 0:
+        return 0.0
+
+    # -----------------------------------------------------
+    # Bounding box
+    # -----------------------------------------------------
+
+    x1, y1, x2, y2 = detection[:4]
+
+    height, width = saliency.shape
+
+    x1 = max(
+        0,
+        min(
+            int(round(x1)),
+            width
+        )
+    )
+
+    x2 = max(
+        0,
+        min(
+            int(round(x2)),
+            width
+        )
+    )
+
+    y1 = max(
+        0,
+        min(
+            int(round(y1)),
+            height
+        )
+    )
+
+    y2 = max(
+        0,
+        min(
+            int(round(y2)),
+            height
+        )
+    )
+
+    # Bounding box inválida
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+
+    # -----------------------------------------------------
+    # Energia dentro da bounding box
+    # -----------------------------------------------------
+
+    bbox_energy = np.sum(
+        saliency[
+            y1:y2,
+            x1:x2
+        ]
+    )
+
+    # -----------------------------------------------------
+    # EBPG
+    # -----------------------------------------------------
+
+    ebpg = (
+        bbox_energy /
+        total_energy
+    )
+
+    return float(
+        ebpg
+    )
+
+
+# =========================================================
+# EBPG para TODAS as bounding boxes
+# =========================================================
+def calculate_ebpg_all_boxes(
+    saliency_maps,
+    detections
+):
+    """
+    Calcula EBPG individualmente para cada detecção.
+
+    Parameters
+    ----------
+    saliency_maps : np.ndarray
+        Mapas de saliência.
+
+        Shape:
+        (D, H, W)
+
+        onde D é o número de detecções.
+
+    detections : np.ndarray
+        Detecções correspondentes.
+
+        Shape:
+        (D, 5)
+
+        Formato:
+        [x1, y1, x2, y2, confidence]
+
+    Returns
+    -------
+    results : list
+        Um resultado para cada detecção.
+    """
+
+    if len(detections) == 0:
+        return []
+
+    if len(saliency_maps) != len(detections):
+        raise ValueError(
+            "O número de mapas de saliência deve "
+            "ser igual ao número de detecções. "
+            f"Mapas: {len(saliency_maps)}, "
+            f"Detecções: {len(detections)}"
+        )
+
+    results = []
+
+    for i, detection in enumerate(detections):
+
+        # =============================================
+        # Mapa EXCLUSIVO desta detecção
+        # =============================================
+
+        saliency = saliency_maps[i]
+
+        # =============================================
+        # EBPG desta detecção
+        # =============================================
+
+        ebpg = calculate_ebpg(
+            saliency=saliency,
+            detection=detection
+        )
+
+        results.append(
+            {
+                "detection_index": i,
+
+                "bbox": detection[:4].copy(),
+
+                "confidence": float(
+                    detection[4]
+                ),
+
+                "ebpg": float(ebpg)
+            }
+        )
+
+    return results
+
+
+# =========================================================
+# Estatísticas do EBPG
+# =========================================================
+
+def calculate_ebpg_statistics(
+    ebpg_results
+):
+    """
+    Calcula média e desvio-padrão
+    dos EBPGs das detecções.
+    """
+
+    if len(ebpg_results) == 0:
+        return {
+            "mean": 0.0,
+            "std": 0.0,
+            "n": 0
+        }
+
+    values = np.array(
+        [
+            result["ebpg"]
+            for result in ebpg_results
+        ],
+        dtype=np.float32
+    )
+
+    mean = float(
+        np.mean(values)
+    )
+
+    if len(values) > 1:
+        std = float(
+            np.std(
+                values,
+                ddof=1
+            )
+        )
+    else:
+        std = 0.0
+
+    return {
+        "mean": mean,
+        "std": std,
+        "n": len(values)
+    }

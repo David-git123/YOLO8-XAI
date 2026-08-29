@@ -10,11 +10,18 @@ class Model:
         input_size=(960, 960),
         conf=0.001
     ):
-        self.model = YOLO(model_path)
+
+        self.model = YOLO(
+            model_path
+        )
+
         self.input_size = input_size
         self.conf = conf
 
-    def run_on_batch(self, tensor):
+    def run_on_batch(
+        self,
+        tensor
+    ):
 
         results = self.model.predict(
             source=tensor,
@@ -29,20 +36,48 @@ class Model:
 
             boxes = result.boxes
 
-            if boxes is None or len(boxes) == 0:
+            if (
+                boxes is None
+                or len(boxes) == 0
+            ):
+
                 predictions.append(
-                    np.empty((0, 5), dtype=np.float32)
+                    np.empty(
+                        (0, 6),
+                        dtype=np.float32
+                    )
                 )
+
                 continue
 
-            xyxy = boxes.xyxy.cpu().numpy()
-            conf = boxes.conf.cpu().numpy()
+            xyxy = (
+                boxes.xyxy
+                .cpu()
+                .numpy()
+            )
 
-            detections = np.column_stack([
-                xyxy,
-                conf
-            ])
+            conf = (
+                boxes.conf
+                .cpu()
+                .numpy()
+            )
 
-            predictions.append(detections)
+            cls = (
+                boxes.cls
+                .cpu()
+                .numpy()
+            )
 
-        return predictions
+            detections = np.column_stack(
+                [
+                    xyxy,
+                    conf,
+                    cls
+                ]
+            )
+
+            predictions.append(
+                detections
+            )
+
+        return predictions  
