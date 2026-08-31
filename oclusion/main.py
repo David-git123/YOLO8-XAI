@@ -56,7 +56,7 @@ print("==========================================")
 model = Model(
     model_path=MODEL_PATH,
     input_size=INPUT_SIZE,
-    conf=0.001
+    conf=0.7
 )
 
 
