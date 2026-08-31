@@ -1,729 +1,368 @@
-# main.py
-
-import os
-import glob
-import json
-
+import cv2
 import numpy as np
-import pandas as pd
+import torch
+from ultralytics import YOLO
 
-from utils import (
-    load_yolov8,
-    explain_image,
-    result_to_csv_dict,
-    calculate_experiment_statistics
-)
+from easy_explain.methods.lrp.yolov8.yolo import YOLOv8LRP
 
 
-# ============================================================
-# CONFIGURAÇÃO DO EXPERIMENTO
-# ============================================================
+MODEL_PATH = "weights/best.pt"
+IMAGE_PATH = "image.jpg"
 
-MODEL_PATH = "best.pt"
+IMGSZ = 960
 
-IMAGE_DIR = "images"
-
-OUTPUT_DIR = "results_lrp_ebpg"
-
-IMG_SIZE = 640
-
+# Somente predições acima desse valor entram no EBPG.
 CONF_THRESHOLD = 0.70
 
-IOU_THRESHOLD = 0.70
-
-# Número de pontos das curvas.
-#
-# steps=20:
-#   0%, 5%, 10%, ..., 100%
-#
-# Cada teste realiza 21 inferências por predição.
-PERTURBATION_STEPS = 20
-
-# Valor utilizado como baseline no Deletion/Insertion.
-#
-# 0.0 = preto
-BASELINE_VALUE = 0.0
-
-# IoU mínimo para considerar que uma detecção perturbada
-# corresponde à detecção original.
-MATCHING_IOU = 0.10
-
-# Parâmetro epsilon da regra LRP.
-LRP_EPSILON = 1e-6
-
-# Ativar/desativar os testes.
-RUN_DELETION = True
-RUN_INSERTION = True
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# ============================================================
-# EXTENSÕES ACEITAS
-# ============================================================
-
-IMAGE_EXTENSIONS = [
-    "*.jpg",
-    "*.jpeg",
-    "*.png",
-    "*.bmp",
-    "*.JPG",
-    "*.JPEG",
-    "*.PNG",
-    "*.BMP"
-]
-
-
-# ============================================================
-# LOCALIZAR IMAGENS
-# ============================================================
-
-def get_image_paths(image_dir):
+def load_image(image_path, imgsz):
     """
-    Localiza todas as imagens no diretório.
+    Carrega a imagem no formato utilizado pelo easy_explain.
     """
 
-    image_paths = []
+    image = cv2.imread(image_path)
 
-    for extension in IMAGE_EXTENSIONS:
+    if image is None:
+        raise FileNotFoundError(image_path)
 
-        image_paths.extend(
-            glob.glob(
-                os.path.join(
-                    image_dir,
-                    extension
-                )
-            )
-        )
-
-    return sorted(
-        list(set(image_paths))
+    image_rgb = cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2RGB
     )
 
+    image_resized = cv2.resize(
+        image_rgb,
+        (imgsz, imgsz)
+    )
 
-# ============================================================
-# SALVAR JSON
-# ============================================================
+    tensor = torch.from_numpy(
+        image_resized.transpose(2, 0, 1)
+    ).float() / 255.0
 
-def save_json(
-    data,
-    path
+    return image, tensor
+
+
+def create_prediction_class_mask(
+    boxes,
+    classes,
+    class_id,
+    height,
+    width
 ):
     """
-    Salva um objeto Python em JSON.
+    Cria uma única máscara para uma classe.
+
+    Todas as bounding boxes preditas pelo modelo
+    pertencentes à classe são unidas.
+
+    Portanto:
+
+        class 0:
+            bbox 1
+            bbox 2
+            bbox 3
+
+    gera UMA máscara para a classe 0.
     """
 
-    with open(
-        path,
-        "w",
-        encoding="utf-8"
-    ) as file:
+    mask = np.zeros(
+        (height, width),
+        dtype=np.float32
+    )
 
-        json.dump(
-            data,
-            file,
-            indent=4,
-            ensure_ascii=False
+    class_boxes = []
+
+    for box, cls in zip(boxes, classes):
+
+        if int(cls) != int(class_id):
+            continue
+
+        x1, y1, x2, y2 = box
+
+        x1 = max(0, min(int(x1), width - 1))
+        y1 = max(0, min(int(y1), height - 1))
+
+        x2 = max(0, min(int(x2), width))
+        y2 = max(0, min(int(y2), height))
+
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        mask[y1:y2, x1:x2] = 1.0
+
+        class_boxes.append(
+            [x1, y1, x2, y2]
         )
 
+    return mask, class_boxes
 
-# ============================================================
-# IMPRIMIR ESTATÍSTICAS
-# ============================================================
 
-def print_metric_statistics(
-    name,
-    statistics
+def calculate_ebpg(
+    explanation,
+    mask
 ):
     """
-    Imprime as estatísticas de uma métrica.
+    EBPG:
+
+        energia dentro da região
+        --------------------------
+        energia total
+
     """
 
-    print("\n" + "-" * 60)
-
-    print(name)
-
-    print("-" * 60)
-
-    if not statistics:
-
-        print("Nenhum valor disponível.")
-
-        return
-
-    print(
-        f"N                  : "
-        f"{statistics['n']}"
-    )
-
-    print(
-        f"Média              : "
-        f"{statistics['mean']:.6f}"
-    )
-
-    print(
-        f"Mediana            : "
-        f"{statistics['median']:.6f}"
-    )
-
-    print(
-        f"Desvio padrão      : "
-        f"{statistics['std']:.6f}"
-    )
-
-    print(
-        f"Variância           : "
-        f"{statistics['variance']:.6f}"
-    )
-
-    print(
-        f"Mínimo              : "
-        f"{statistics['min']:.6f}"
-    )
-
-    print(
-        f"Q1                  : "
-        f"{statistics['q1']:.6f}"
-    )
-
-    print(
-        f"Q3                  : "
-        f"{statistics['q3']:.6f}"
-    )
-
-    print(
-        f"IQR                 : "
-        f"{statistics['iqr']:.6f}"
-    )
-
-    print(
-        f"Máximo              : "
-        f"{statistics['max']:.6f}"
-    )
-
-    print(
-        f"IC 95% inferior     : "
-        f"{statistics['ci95_low']:.6f}"
-    )
-
-    print(
-        f"IC 95% superior     : "
-        f"{statistics['ci95_high']:.6f}"
-    )
-
-    if statistics["shapiro_p"] is not None:
-
-        print(
-            f"Shapiro-Wilk p      : "
-            f"{statistics['shapiro_p']:.6f}"
+    if isinstance(
+        explanation,
+        torch.Tensor
+    ):
+        explanation = (
+            explanation
+            .detach()
+            .cpu()
+            .numpy()
         )
 
+    explanation = np.squeeze(
+        explanation
+    )
 
-# ============================================================
-# MAIN
-# ============================================================
+    # O easy_explain retorna uma explicação
+    # espacial. Usamos a magnitude da relevância.
+    explanation = np.abs(
+        explanation
+    ).astype(np.float32)
+
+    # Ajusta máscara ao tamanho da explicação
+    if explanation.shape != mask.shape:
+
+        mask = cv2.resize(
+            mask,
+            (
+                explanation.shape[1],
+                explanation.shape[0]
+            ),
+            interpolation=cv2.INTER_NEAREST
+        )
+
+    total_energy = np.sum(
+        explanation
+    )
+
+    inside_energy = np.sum(
+        explanation * mask
+    )
+
+    outside_energy = (
+        total_energy -
+        inside_energy
+    )
+
+    if total_energy <= 1e-12:
+        return np.nan
+
+    ebpg = (
+        inside_energy /
+        total_energy
+    )
+
+    return float(ebpg)
+
 
 def main():
 
-    # ========================================================
-    # DIRETÓRIOS
-    # ========================================================
+    # ======================================================
+    # MODELO
+    # ======================================================
 
-    os.makedirs(
-        OUTPUT_DIR,
-        exist_ok=True
-    )
-
-    # ========================================================
-    # CABEÇALHO
-    # ========================================================
-
-    print("=" * 70)
-    print("YOLOv8 + LRP + EBPG + DELETION + INSERTION")
-    print("=" * 70)
-
-    print(
-        f"\nModelo: {MODEL_PATH}"
-    )
-
-    print(
-        f"Imagens: {IMAGE_DIR}"
-    )
-
-    print(
-        f"Output: {OUTPUT_DIR}"
-    )
-
-    print(
-        f"Image size: {IMG_SIZE}"
-    )
-
-    print(
-        f"Confidence threshold: {CONF_THRESHOLD}"
-    )
-
-    print(
-        f"Perturbation steps: {PERTURBATION_STEPS}"
-    )
-
-    print(
-        f"Deletion: {RUN_DELETION}"
-    )
-
-    print(
-        f"Insertion: {RUN_INSERTION}"
-    )
-
-    # ========================================================
-    # VERIFICAÇÕES
-    # ========================================================
-
-    if not os.path.isfile(
-        MODEL_PATH
-    ):
-
-        raise FileNotFoundError(
-            f"Modelo não encontrado: "
-            f"{MODEL_PATH}"
-        )
-
-    if not os.path.isdir(
-        IMAGE_DIR
-    ):
-
-        raise FileNotFoundError(
-            f"Diretório de imagens não encontrado: "
-            f"{IMAGE_DIR}"
-        )
-
-    # ========================================================
-    # CARREGAR MODELO
-    # ========================================================
-
-    print("\n" + "=" * 70)
-    print("CARREGANDO MODELO")
-    print("=" * 70)
-
-    model, device = load_yolov8(
+    model = YOLO(
         MODEL_PATH
     )
 
-    print(
-        f"Device: {device}"
+    model.to(DEVICE)
+
+    # ======================================================
+    # LRP
+    # ======================================================
+
+    lrp = YOLOv8LRP(
+        model=model,
+        contrastive=False,
+        power=1,
+        positive=True,
+        eps=1e-6,
+        device=torch.device(
+            DEVICE
+        )
     )
 
-    # ========================================================
-    # VERIFICAR NÚMERO DE CLASSES
-    # ========================================================
+    # ======================================================
+    # IMAGEM
+    # ======================================================
 
-    try:
-
-        names = model.names
-
-        number_classes = len(
-            names
-        )
-
-        print(
-            f"Classes detectadas: "
-            f"{number_classes}"
-        )
-
-        print(
-            f"Names: {names}"
-        )
-
-        if number_classes != 1:
-
-            raise ValueError(
-                "Este experimento foi configurado "
-                "para um modelo YOLOv8 com exatamente "
-                "uma classe."
-            )
-
-    except Exception as error:
-
-        print(
-            "\nAviso: não foi possível verificar "
-            "automaticamente o número de classes."
-        )
-
-        print(
-            f"Detalhes: {error}"
-        )
-
-    # ========================================================
-    # LOCALIZAR IMAGENS
-    # ========================================================
-
-    image_paths = get_image_paths(
-        IMAGE_DIR
+    original_image, frame = load_image(
+        IMAGE_PATH,
+        IMGSZ
     )
 
-    print(
-        f"\nImagens encontradas: "
-        f"{len(image_paths)}"
+    frame = frame.to(
+        DEVICE
     )
 
-    if len(image_paths) == 0:
+    height = frame.shape[1]
+    width = frame.shape[2]
 
-        raise RuntimeError(
-            "Nenhuma imagem encontrada."
+    # ======================================================
+    # PREDIÇÕES DO MODELO
+    # ======================================================
+
+    results = model.predict(
+        source=original_image,
+        imgsz=IMGSZ,
+        conf=CONF_THRESHOLD,
+        verbose=False,
+        device=DEVICE
+    )
+
+    result = results[0]
+
+    boxes = (
+        result.boxes.xyxy
+        .detach()
+        .cpu()
+        .numpy()
+    )
+
+    classes = (
+        result.boxes.cls
+        .detach()
+        .cpu()
+        .numpy()
+    )
+
+    confidences = (
+        result.boxes.conf
+        .detach()
+        .cpu()
+        .numpy()
+    )
+
+    # ======================================================
+    # MOSTRA PREDIÇÕES
+    # ======================================================
+
+    print("\nPredições utilizadas:")
+
+    for i in range(len(boxes)):
+
+        print(
+            f"Detection {i}: "
+            f"class={int(classes[i])}, "
+            f"conf={confidences[i]:.4f}, "
+            f"box={boxes[i]}"
         )
 
-    # ========================================================
-    # RESULTADOS
-    # ========================================================
+    # ======================================================
+    # CLASSES PREDITAS
+    # ======================================================
+
+    predicted_classes = sorted(
+        set(
+            int(cls)
+            for cls in classes
+        )
+    )
+
+    # ======================================================
+    # EBPG POR CLASSE
+    # ======================================================
 
     all_results = []
 
-    successful_images = 0
+    for class_id in predicted_classes:
 
-    failed_images = 0
-
-    total_detections = 0
-
-    # ========================================================
-    # PROCESSAMENTO
-    # ========================================================
-
-    for image_number, image_path in enumerate(
-        image_paths,
-        start=1
-    ):
-
-        print("\n")
-        print("=" * 70)
+        class_name = model.names[
+            class_id
+        ]
 
         print(
-            f"IMAGEM "
-            f"{image_number}/{len(image_paths)}"
+            f"\nClasse {class_id}: "
+            f"{class_name}"
         )
 
-        print(
-            os.path.basename(
-                image_path
+        # --------------------------------------------------
+        # Bounding boxes dessa classe
+        # --------------------------------------------------
+
+        class_mask, class_boxes = (
+            create_prediction_class_mask(
+                boxes=boxes,
+                classes=classes,
+                class_id=class_id,
+                height=height,
+                width=width
             )
         )
 
-        print("=" * 70)
-
-        try:
-
-            results = explain_image(
-                model=model,
-
-                image_path=image_path,
-
-                img_size=IMG_SIZE,
-
-                conf=CONF_THRESHOLD,
-
-                iou=IOU_THRESHOLD,
-
-                device=device,
-
-                save_dir=OUTPUT_DIR,
-
-                run_deletion=RUN_DELETION,
-
-                run_insertion=RUN_INSERTION,
-
-                perturbation_steps=PERTURBATION_STEPS,
-
-                baseline_value=BASELINE_VALUE,
-
-                matching_iou=MATCHING_IOU,
-
-                lrp_epsilon=LRP_EPSILON
-            )
-
-            successful_images += 1
-
-        except Exception as error:
-            import traceback
-            failed_images += 1
-
-
-            print("\nERRO AO PROCESSAR:", flush=True)
-            print(image_path, flush=True)
-
-            traceback.print_exc()
-
-            continue
-
-        # ----------------------------------------------------
-        # Resultados da imagem
-        # ----------------------------------------------------
-
-        total_detections += len(
-            results
+        print(
+            f"Predições da classe: "
+            f"{len(class_boxes)}"
         )
 
-        all_results.extend(
-            results
+        # --------------------------------------------------
+        # LRP DA CLASSE
+        # --------------------------------------------------
+
+        explanation = lrp.explain(
+            frame,
+            cls=class_id,
+            conf=CONF_THRESHOLD,
+            max_class_only=True,
+            contrastive=False
+        )
+
+        # --------------------------------------------------
+        # EBPG
+        # --------------------------------------------------
+
+        ebpg = calculate_ebpg(
+            explanation,
+            class_mask
         )
 
         print(
-            f"\nDetecções explicadas nesta imagem: "
-            f"{len(results)}"
+            f"EBPG = {ebpg:.6f}"
         )
 
-    # ========================================================
-    # VERIFICAR RESULTADOS
-    # ========================================================
+        all_results.append(
+            {
+                "class_id": class_id,
+                "class_name": class_name,
+                "num_predictions": len(
+                    class_boxes
+                ),
+                "ebpg": ebpg
+            }
+        )
 
-    print("\n" + "=" * 70)
-    print("PROCESSAMENTO FINALIZADO")
-    print("=" * 70)
+    # ======================================================
+    # RESULTADO FINAL
+    # ======================================================
 
-    print(
-        f"Imagens encontradas: "
-        f"{len(image_paths)}"
-    )
+    print("\n" + "=" * 60)
+    print("EBPG POR CLASSE")
+    print("=" * 60)
 
-    print(
-        f"Imagens processadas: "
-        f"{successful_images}"
-    )
-
-    print(
-        f"Imagens com erro: "
-        f"{failed_images}"
-    )
-
-    print(
-        f"Total de predições explicadas: "
-        f"{total_detections}"
-    )
-
-    if len(all_results) == 0:
+    for item in all_results:
 
         print(
-            "\nNenhuma predição foi encontrada."
+            f"{item['class_name']} "
+            f"(class {item['class_id']}): "
+            f"EBPG = {item['ebpg']:.6f} "
+            f"| predictions = "
+            f"{item['num_predictions']}"
         )
 
-        return
-
-    # ========================================================
-    # CONVERTER RESULTADOS PARA DATAFRAME
-    # ========================================================
-
-    rows = []
-
-    for result in all_results:
-
-        rows.append(
-            result_to_csv_dict(
-                result
-            )
-        )
-
-    df = pd.DataFrame(
-        rows
-    )
-
-    # ========================================================
-    # SALVAR CSV
-    # ========================================================
-
-    csv_path = os.path.join(
-        OUTPUT_DIR,
-        "results.csv"
-    )
-
-    df.to_csv(
-        csv_path,
-        index=False
-    )
-
-    print(
-        f"\nCSV salvo em:"
-        f"\n{csv_path}"
-    )
-
-    # ========================================================
-    # ESTATÍSTICAS
-    # ========================================================
-
-    statistics = calculate_experiment_statistics(
-        all_results
-    )
-
-    # ========================================================
-    # IMPRIMIR ESTATÍSTICAS
-    # ========================================================
-
-    print("\n" + "=" * 70)
-    print("ESTATÍSTICAS")
-    print("=" * 70)
-
-    # --------------------------------------------------------
-    # EBPG
-    # --------------------------------------------------------
-
-    print_metric_statistics(
-        "EBPG",
-        statistics.get(
-            "EBPG",
-            {}
-        )
-    )
-
-    # --------------------------------------------------------
-    # DELETION
-    # --------------------------------------------------------
-
-    print_metric_statistics(
-        "Deletion — Normalized AUC",
-        statistics.get(
-            "Deletion_normalized_AUC",
-            {}
-        )
-    )
-
-    # --------------------------------------------------------
-    # INSERTION
-    # --------------------------------------------------------
-
-    print_metric_statistics(
-        "Insertion — Normalized AUC",
-        statistics.get(
-            "Insertion_normalized_AUC",
-            {}
-        )
-    )
-
-    # ========================================================
-    # SALVAR ESTATÍSTICAS
-    # ========================================================
-
-    statistics_path = os.path.join(
-        OUTPUT_DIR,
-        "statistics.json"
-    )
-
-    save_json(
-        statistics,
-        statistics_path
-    )
-
-    print(
-        f"\nEstatísticas salvas em:"
-        f"\n{statistics_path}"
-    )
-
-    # ========================================================
-    # RESUMO DO EXPERIMENTO
-    # ========================================================
-
-    summary = {
-        "model": MODEL_PATH,
-
-        "image_directory": IMAGE_DIR,
-
-        "image_size": IMG_SIZE,
-
-        "confidence_threshold":
-            CONF_THRESHOLD,
-
-        "iou_threshold":
-            IOU_THRESHOLD,
-
-        "perturbation_steps":
-            PERTURBATION_STEPS,
-
-        "baseline_value":
-            BASELINE_VALUE,
-
-        "matching_iou":
-            MATCHING_IOU,
-
-        "lrp_epsilon":
-            LRP_EPSILON,
-
-        "run_deletion":
-            RUN_DELETION,
-
-        "run_insertion":
-            RUN_INSERTION,
-
-        "total_images":
-            len(image_paths),
-
-        "successful_images":
-            successful_images,
-
-        "failed_images":
-            failed_images,
-
-        "total_detections":
-            total_detections
-    }
-
-    summary_path = os.path.join(
-        OUTPUT_DIR,
-        "experiment_summary.json"
-    )
-
-    save_json(
-        summary,
-        summary_path
-    )
-
-    print(
-        f"Resumo salvo em:"
-        f"\n{summary_path}"
-    )
-
-    # ========================================================
-    # FINAL
-    # ========================================================
-
-    print("\n" + "=" * 70)
-    print("RESUMO FINAL")
-    print("=" * 70)
-
-    if statistics.get("EBPG"):
-
-        print(
-            f"EBPG médio: "
-            f"{statistics['EBPG']['mean']:.4f}"
-        )
-
-        print(
-            f"EBPG mediano: "
-            f"{statistics['EBPG']['median']:.4f}"
-        )
-
-    if statistics.get(
-        "Deletion_normalized_AUC"
-    ):
-
-        print(
-            f"Deletion AUC médio: "
-            f"{statistics['Deletion_normalized_AUC']['mean']:.4f}"
-        )
-
-    if statistics.get(
-        "Insertion_normalized_AUC"
-    ):
-
-        print(
-            f"Insertion AUC médio: "
-            f"{statistics['Insertion_normalized_AUC']['mean']:.4f}"
-        )
-
-    print(
-        "\nResultados:"
-        f"\n{OUTPUT_DIR}"
-    )
-
-    print("=" * 70)
-
-
-# ============================================================
-# EXECUÇÃO
-# ============================================================
 
 if __name__ == "__main__":
-
     main()
