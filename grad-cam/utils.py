@@ -310,7 +310,20 @@ def generate_gradcam(
     # --------------------------------------------------------
     # BACKPROPAGATION
     # --------------------------------------------------------
+    print("===== DEBUG GRAD-CAM =====")
+    print("inference mode:",
+      torch.is_inference_mode_enabled())
 
+    print("target:",
+      target)
+
+    print("target requires_grad:",
+      target.requires_grad)
+
+    print("target grad_fn:",
+      target.grad_fn)
+
+    print("==========================")
     target.backward()
 
     if hooks.activations is None:

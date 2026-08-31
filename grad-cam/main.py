@@ -29,9 +29,9 @@ MODEL_PATH = "/content/best.pt"
 
 IMAGE_PATH = "/content/teste.png"
 
-INPUT_SIZE = 960
+INPUT_SIZE = 640
 
-CONF_THRESHOLD = 0.25
+CONF_THRESHOLD = 0.7
 
 TARGET_LAYER_INDEX = -2
 
