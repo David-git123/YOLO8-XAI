@@ -533,8 +533,8 @@ class YOLODetectionTarget(nn.Module):
         )
 
     def forward(self, x):
-
-        output = self.model(x)
+        with torch.inference_mode(False):
+            output = self.model(x)
 
         if isinstance(
             output,
@@ -642,7 +642,6 @@ def compute_lrp(
         relevance.detach(),
         output.detach()
     )
-
 # ============================================================
 # RELEVÂNCIA -> SALIÊNCIA
 # ============================================================
