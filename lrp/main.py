@@ -439,21 +439,14 @@ def main():
             successful_images += 1
 
         except Exception as error:
-
+            import traceback
             failed_images += 1
 
-            print(
-                "\nERRO AO PROCESSAR:"
-            )
 
-            print(
-                image_path
-            )
+            print("\nERRO AO PROCESSAR:", flush=True)
+            print(image_path, flush=True)
 
-            print(
-                f"{type(error).__name__}: "
-                f"{error}"
-            )
+            traceback.print_exc()
 
             continue
 

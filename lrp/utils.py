@@ -1993,14 +1993,14 @@ def explain_image(
         # ----------------------------------------------------
         # LRP
         # ----------------------------------------------------
-
+        print("DEBUG 1: antes do compute_lrp", flush=True)
         relevance, target_score = compute_lrp(
             model=model.model,
             image_tensor=image_tensor,
             raw_detection_index=raw_index,
             epsilon=lrp_epsilon
         )
-
+        print("DEBUG 2: depois do compute_lrp", flush=True)
         # ----------------------------------------------------
         # Saliency
         # ----------------------------------------------------
