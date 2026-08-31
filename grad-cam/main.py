@@ -1,23 +1,25 @@
 import os
+import glob
+import traceback
+
+import cv2
+import numpy as np
+import pandas as pd
 import torch
-import json
 
 from ultralytics import YOLO
 
-from utils import (
-    load_image,
-    GradCAMHooks,
-    get_detections,
+from gradcam_yolo import (
     generate_gradcam,
+    save_gradcam_visualization,
+)
+
+from metrics import (
     calculate_ebpg,
-    calculate_statistics,
+    calculate_pointing_game,
     deletion_test,
     insertion_test,
-    calculate_test_statistics,
-    save_saliency_map,
-    save_overlay,
-    save_deletion_insertion_plot,
-    save_results
+    save_curve,
 )
 
 
@@ -25,596 +27,964 @@ from utils import (
 # CONFIGURAÇÃO
 # ============================================================
 
-MODEL_PATH = "/content/best.pt"
+MODEL_PATH = "best.pt"
 
-IMAGE_PATH = "/content/teste.png"
+IMAGE_DIR = "images"
 
-INPUT_SIZE = 640
+OUTPUT_DIR = "results_gradcam"
 
-CONF_THRESHOLD = 0.7
+IMAGE_SIZE = 640
 
+# Somente detecções acima deste threshold serão explicadas.
+CONF_THRESHOLD = 0.70
+
+# NMS do YOLO.
+IOU_THRESHOLD = 0.70
+
+# Número de intervalos:
+#
+# 20 -> 0%, 5%, ..., 100%
+#
+# Portanto:
+#
+# 21 inferências por curva.
+PERTURBATION_STEPS = 20
+
+BASELINE_VALUE = 0.0
+
+# IoU usado para identificar a mesma detecção durante
+# Deletion/Insertion.
+MATCHING_IOU = 0.10
+
+# Camada utilizada pelo Grad-CAM.
+#
+# No seu modelo você já verificou que -2 é C2f.
 TARGET_LAYER_INDEX = -2
 
-STEPS = 20
+# Classe Tubastrea.
+TARGET_CLASS = 0
 
-OUTPUT_DIR = "/content/gradcam_results"
+# ------------------------------------------------------------
+# Ground truth
+# ------------------------------------------------------------
+#
+# Se você possuir:
+#
+# labels/
+#     TubastraeaZoomOut.txt
+#
+# coloque:
+#
+# LABELS_DIR = "labels"
+#
+# Caso contrário:
+#
+# LABELS_DIR = None
+#
+# Nesse caso EBPG será calculado em relação à bounding box
+# detectada pelo próprio modelo.
+#
+# Para avaliação metodológica de localização, o ideal é usar
+# ground truth.
+LABELS_DIR = None
 
-SALIENCY_DIR = os.path.join(
-    OUTPUT_DIR,
-    "saliency_maps"
-)
-
-OVERLAY_DIR = os.path.join(
-    OUTPUT_DIR,
-    "overlays"
-)
-
-CURVES_DIR = os.path.join(
-    OUTPUT_DIR,
-    "deletion_insertion"
-)
-
-os.makedirs(
-    SALIENCY_DIR,
-    exist_ok=True
-)
-
-os.makedirs(
-    OVERLAY_DIR,
-    exist_ok=True
-)
-
-os.makedirs(
-    CURVES_DIR,
-    exist_ok=True
-)
+SAVE_CURVES = True
 
 
 # ============================================================
-# DEVICE
+# UTILITÁRIOS
 # ============================================================
 
-device = (
-    "cuda"
-    if torch.cuda.is_available()
-    else "cpu"
-)
+def load_images(directory):
 
-print(
-    f"Device: {device}"
-)
+    extensions = [
+        "*.jpg",
+        "*.jpeg",
+        "*.png",
+        "*.bmp",
+        "*.webp",
+    ]
 
+    files = []
 
-# ============================================================
-# MODELO
-# ============================================================
+    for extension in extensions:
 
-print(
-    "\nCarregando modelo..."
-)
+        files.extend(
+            glob.glob(
+                os.path.join(
+                    directory,
+                    extension,
+                )
+            )
+        )
 
-yolo = YOLO(
-    MODEL_PATH
-)
-
-model = yolo.model
-
-model.to(
-    device
-)
-
-model.eval()
-
-print(
-    "Modelo carregado."
-)
+    return sorted(files)
 
 
-# ============================================================
-# CAMADA DO GRAD-CAM
-# ============================================================
-
-target_layer = model.model[
-    TARGET_LAYER_INDEX
-]
-
-print(
-    "\nCamada do Grad-CAM:"
-)
-
-print(
-    f"Índice: {TARGET_LAYER_INDEX}"
-)
-
-print(
-    target_layer
-)
-
-
-# ============================================================
-# HOOKS
-# ============================================================
-
-hooks = GradCAMHooks(
-    target_layer
-)
-
-
-# ============================================================
-# IMAGEM
-# ============================================================
-
-x, original_image = load_image(
-    IMAGE_PATH,
-    input_size=INPUT_SIZE,
-    device=device
-)
-
-print(
-    "\nInput:",
-    x.shape
-)
-
-
-# ============================================================
-# DETECÇÕES
-# ============================================================
-
-detections = get_detections(
-    model,
-    x,
-    conf_threshold=CONF_THRESHOLD
-)
-
-print(
-    f"\nDetecções encontradas: "
-    f"{len(detections)}"
-)
-
-
-# ============================================================
-# RESULTADOS
-# ============================================================
-
-results = []
-
-ebpg_values = []
-
-deletion_auc_values = []
-
-insertion_auc_values = []
-
-
-# ============================================================
-# PROCESSAR CADA DETECÇÃO
-# ============================================================
-
-for detection_id, detection in enumerate(
-    detections
+def load_ground_truth(
+    image_path,
+    labels_dir,
 ):
+    """
+    Lê labels no formato YOLO:
 
-    prediction_index = (
-        detection[
-            "prediction_index"
+        class x_center y_center width height
+
+    valores normalizados em [0,1].
+    """
+
+    if labels_dir is None:
+        return []
+
+    filename = os.path.splitext(
+        os.path.basename(image_path)
+    )[0]
+
+    label_path = os.path.join(
+        labels_dir,
+        filename + ".txt",
+    )
+
+    if not os.path.exists(
+        label_path
+    ):
+        return []
+
+    image = cv2.imread(
+        image_path
+    )
+
+    if image is None:
+        return []
+
+    h, w = image.shape[:2]
+
+    ground_truth = []
+
+    with open(
+        label_path,
+        "r",
+    ) as f:
+
+        for line in f:
+
+            values = line.strip().split()
+
+            if len(values) < 5:
+                continue
+
+            cls = int(
+                float(values[0])
+            )
+
+            xc = float(
+                values[1]
+            ) * w
+
+            yc = float(
+                values[2]
+            ) * h
+
+            bw = float(
+                values[3]
+            ) * w
+
+            bh = float(
+                values[4]
+            ) * h
+
+            x1 = xc - bw / 2
+            y1 = yc - bh / 2
+            x2 = xc + bw / 2
+            y2 = yc + bh / 2
+
+            ground_truth.append(
+                {
+                    "class_id": cls,
+                    "box": np.array(
+                        [
+                            x1,
+                            y1,
+                            x2,
+                            y2,
+                        ],
+                        dtype=np.float32,
+                    ),
+                }
+            )
+
+    return ground_truth
+
+
+def find_best_ground_truth(
+    predicted_box,
+    predicted_class,
+    ground_truth,
+):
+    """
+    Encontra a GT com maior IoU para a detecção.
+    """
+
+    best_gt = None
+    best_iou = 0.0
+
+    from metrics import calculate_iou
+
+    for gt in ground_truth:
+
+        if gt["class_id"] != predicted_class:
+            continue
+
+        iou = calculate_iou(
+            predicted_box,
+            gt["box"],
+        )
+
+        if iou > best_iou:
+
+            best_iou = iou
+            best_gt = gt
+
+    return best_gt, best_iou
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print("=" * 70)
+
+    print(
+        "YOLOv8 + pytorch-grad-cam + EBPG + DELETION + INSERTION"
+    )
+
+    print("=" * 70)
+
+    print(
+        f"Modelo: {MODEL_PATH}"
+    )
+
+    print(
+        f"Imagens: {IMAGE_DIR}"
+    )
+
+    print(
+        f"Output: {OUTPUT_DIR}"
+    )
+
+    print(
+        f"Image size: {IMAGE_SIZE}"
+    )
+
+    print(
+        f"Confidence threshold: {CONF_THRESHOLD}"
+    )
+
+    print(
+        f"NMS IoU threshold: {IOU_THRESHOLD}"
+    )
+
+    print(
+        f"Matching IoU: {MATCHING_IOU}"
+    )
+
+    print(
+        f"Perturbation steps: {PERTURBATION_STEPS}"
+    )
+
+    print(
+        f"Baseline: {BASELINE_VALUE}"
+    )
+
+    print(
+        f"Grad-CAM layer: {TARGET_LAYER_INDEX}"
+    )
+
+    print("=" * 70)
+
+    # --------------------------------------------------------
+    # DEVICE
+    # --------------------------------------------------------
+
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+
+    print(
+        f"Device: {device}"
+    )
+
+    # --------------------------------------------------------
+    # MODELO
+    # --------------------------------------------------------
+
+    print(
+        "\nCarregando modelo..."
+    )
+
+    yolo = YOLO(
+        MODEL_PATH
+    )
+
+    yolo.model.to(
+        device
+    )
+
+    yolo.model.eval()
+
+    print(
+        "Modelo carregado."
+    )
+
+    print(
+        f"Classes: {yolo.names}"
+    )
+
+    # --------------------------------------------------------
+    # TARGET LAYER
+    # --------------------------------------------------------
+
+    target_layer = (
+        yolo.model.model[
+            TARGET_LAYER_INDEX
         ]
     )
 
-    box = detection["box"]
-
-    confidence = (
-        detection["confidence"]
-    )
-
-
     print(
-        "\n"
-        + "=" * 70
+        "\nCamada Grad-CAM:"
     )
 
     print(
-        f"DETECÇÃO {detection_id}"
+        f"Índice: {TARGET_LAYER_INDEX}"
     )
 
     print(
-        f"Prediction index: "
-        f"{prediction_index}"
+        target_layer
+    )
+
+    # --------------------------------------------------------
+    # IMAGENS
+    # --------------------------------------------------------
+
+    image_paths = load_images(
+        IMAGE_DIR
     )
 
     print(
-        f"Confidence: "
-        f"{confidence:.4f}"
+        f"\nImagens encontradas: {len(image_paths)}"
     )
 
+    if len(image_paths) == 0:
 
-    # ========================================================
-    # GRAD-CAM
-    # ========================================================
+        print(
+            "Nenhuma imagem encontrada."
+        )
 
-    saliency_map = generate_gradcam(
-        model=model,
-        x=x,
-        hooks=hooks,
-        prediction_index=prediction_index
+        return
+
+    os.makedirs(
+        OUTPUT_DIR,
+        exist_ok=True,
     )
 
+    all_results = []
+
+    processed_images = 0
+    failed_images = 0
+    total_explanations = 0
 
     # ========================================================
-    # EBPG
+    # PROCESSAMENTO
     # ========================================================
 
-    ebpg = calculate_ebpg(
-        saliency_map,
-        box
-    )
+    for image_number, image_path in enumerate(
+        image_paths,
+        start=1,
+    ):
 
-    ebpg_values.append(
-        ebpg
-    )
+        print(
+            "\n" + "=" * 70
+        )
 
+        print(
+            f"IMAGEM {image_number}/{len(image_paths)}"
+        )
+
+        print(
+            os.path.basename(image_path)
+        )
+
+        print(
+            "=" * 70
+        )
+
+        try:
+
+            image = cv2.imread(
+                image_path
+            )
+
+            if image is None:
+                raise RuntimeError(
+                    f"Não foi possível abrir {image_path}"
+                )
+
+            # ------------------------------------------------
+            # DETECÇÃO NORMAL
+            # ------------------------------------------------
+
+            results = yolo.predict(
+                source=image,
+                imgsz=IMAGE_SIZE,
+                conf=CONF_THRESHOLD,
+                iou=IOU_THRESHOLD,
+                device=device,
+                verbose=False,
+            )
+
+            result = results[0]
+
+            if result.boxes is None:
+
+                print(
+                    "Nenhuma bounding box encontrada."
+                )
+
+                continue
+
+            number_detections = len(
+                result.boxes
+            )
+
+            print(
+                f"Detecções acima de {CONF_THRESHOLD}: "
+                f"{number_detections}"
+            )
+
+            if number_detections == 0:
+                continue
+
+            # ------------------------------------------------
+            # GROUND TRUTH
+            # ------------------------------------------------
+
+            ground_truth = load_ground_truth(
+                image_path,
+                LABELS_DIR,
+            )
+
+            if LABELS_DIR is not None:
+
+                if ground_truth:
+
+                    print(
+                        f"Ground truth encontrada: "
+                        f"{len(ground_truth)} boxes"
+                    )
+
+                else:
+
+                    print(
+                        "Nenhuma ground truth encontrada. "
+                        "EBPG usará a box prevista."
+                    )
+
+            # ------------------------------------------------
+            # DETECÇÕES
+            # ------------------------------------------------
+
+            for detection_index in range(
+                number_detections
+            ):
+
+                print(
+                    "\n" + "-" * 70
+                )
+
+                print(
+                    f"DETECÇÃO {detection_index}"
+                )
+
+                box = (
+                    result.boxes.xyxy[
+                        detection_index
+                    ]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
+
+                confidence = float(
+                    result.boxes.conf[
+                        detection_index
+                    ]
+                    .detach()
+                    .cpu()
+                )
+
+                class_id = int(
+                    result.boxes.cls[
+                        detection_index
+                    ]
+                    .detach()
+                    .cpu()
+                )
+
+                print(
+                    f"Classe: {class_id}"
+                )
+
+                print(
+                    f"Confidence: {confidence:.4f}"
+                )
+
+                print(
+                    f"Box: {box.tolist()}"
+                )
+
+                # ------------------------------------------------
+                # BOX DE REFERÊNCIA PARA EBPG
+                # ------------------------------------------------
+
+                reference_box = box.copy()
+
+                reference_type = (
+                    "predicted_box"
+                )
+
+                gt_iou = np.nan
+
+                if ground_truth:
+
+                    gt, gt_iou_value = (
+                        find_best_ground_truth(
+                            box,
+                            class_id,
+                            ground_truth,
+                        )
+                    )
+
+                    if gt is not None:
+
+                        reference_box = (
+                            gt["box"].copy()
+                        )
+
+                        reference_type = (
+                            "ground_truth"
+                        )
+
+                        gt_iou = (
+                            gt_iou_value
+                        )
+
+                        print(
+                            f"GT IoU: {gt_iou:.4f}"
+                        )
+
+                # ------------------------------------------------
+                # GRAD-CAM
+                # ------------------------------------------------
+
+                print(
+                    "\nGerando Grad-CAM..."
+                )
+
+                cam_result = generate_gradcam(
+                    yolo_model=yolo,
+                    image=image,
+                    box=box,
+                    class_id=class_id,
+                    imgsz=IMAGE_SIZE,
+                    target_layer_index=TARGET_LAYER_INDEX,
+                    device=device,
+                )
+
+                saliency = (
+                    cam_result["saliency"]
+                )
+
+                raw_index = (
+                    cam_result["raw_index"]
+                )
+
+                raw_iou = (
+                    cam_result["raw_iou"]
+                )
+
+                print(
+                    f"RAW index: {raw_index}"
+                )
+
+                print(
+                    f"RAW box IoU: {raw_iou:.4f}"
+                )
+
+                # ------------------------------------------------
+                # EBPG
+                # ------------------------------------------------
+
+                ebpg = calculate_ebpg(
+                    saliency,
+                    reference_box,
+                )
+
+                pointing_game = (
+                    calculate_pointing_game(
+                        saliency,
+                        reference_box,
+                    )
+                )
+
+                print(
+                    f"EBPG: {ebpg:.6f}"
+                )
+
+                print(
+                    f"Pointing Game: "
+                    f"{pointing_game:.0f}"
+                )
+
+                # ------------------------------------------------
+                # VISUALIZAÇÃO
+                # ------------------------------------------------
+
+                image_name = os.path.splitext(
+                    os.path.basename(
+                        image_path
+                    )
+                )[0]
+
+                cam_filename = (
+                    f"{image_name}"
+                    f"_det{detection_index}"
+                    f"_gradcam.jpg"
+                )
+
+                cam_path = os.path.join(
+                    OUTPUT_DIR,
+                    cam_filename,
+                )
+
+                save_gradcam_visualization(
+                    image=image,
+                    saliency=saliency,
+                    box=box,
+                    output_path=cam_path,
+                )
+
+                print(
+                    f"Grad-CAM salvo: {cam_path}"
+                )
+
+                # ------------------------------------------------
+                # DELETION
+                # ------------------------------------------------
+
+                print(
+                    "\nExecutando Deletion..."
+                )
+
+                deletion = deletion_test(
+                    model=yolo,
+                    image=image,
+                    saliency=saliency,
+                    target_box=box,
+                    target_class=class_id,
+                    original_score=confidence,
+                    steps=PERTURBATION_STEPS,
+                    baseline=BASELINE_VALUE,
+                    iou_nms=IOU_THRESHOLD,
+                    matching_iou=MATCHING_IOU,
+                )
+
+                print(
+                    f"Deletion AUC: "
+                    f"{deletion['auc']:.6f}"
+                )
+
+                print(
+                    f"Deletion normalized AUC: "
+                    f"{deletion['normalized_auc']:.6f}"
+                )
+
+                # ------------------------------------------------
+                # INSERTION
+                # ------------------------------------------------
+
+                print(
+                    "\nExecutando Insertion..."
+                )
+
+                insertion = insertion_test(
+                    model=yolo,
+                    image=image,
+                    saliency=saliency,
+                    target_box=box,
+                    target_class=class_id,
+                    original_score=confidence,
+                    steps=PERTURBATION_STEPS,
+                    baseline=BASELINE_VALUE,
+                    iou_nms=IOU_THRESHOLD,
+                    matching_iou=MATCHING_IOU,
+                )
+
+                print(
+                    f"Insertion AUC: "
+                    f"{insertion['auc']:.6f}"
+                )
+
+                print(
+                    f"Insertion normalized AUC: "
+                    f"{insertion['normalized_auc']:.6f}"
+                )
+
+                # ------------------------------------------------
+                # CURVAS
+                # ------------------------------------------------
+
+                if SAVE_CURVES:
+
+                    deletion_path = os.path.join(
+                        OUTPUT_DIR,
+                        f"{image_name}"
+                        f"_det{detection_index}"
+                        f"_deletion.png",
+                    )
+
+                    save_curve(
+                        deletion["fractions"],
+                        deletion["scores"],
+                        deletion_path,
+                        f"Deletion - "
+                        f"{image_name} "
+                        f"Detection {detection_index}",
+                        "Detection confidence",
+                    )
+
+                    insertion_path = os.path.join(
+                        OUTPUT_DIR,
+                        f"{image_name}"
+                        f"_det{detection_index}"
+                        f"_insertion.png",
+                    )
+
+                    save_curve(
+                        insertion["fractions"],
+                        insertion["scores"],
+                        insertion_path,
+                        f"Insertion - "
+                        f"{image_name} "
+                        f"Detection {detection_index}",
+                        "Detection confidence",
+                    )
+
+                # ------------------------------------------------
+                # RESULTADO
+                # ------------------------------------------------
+
+                all_results.append(
+                    {
+                        "image": os.path.basename(
+                            image_path
+                        ),
+
+                        "detection_index":
+                            detection_index,
+
+                        "class_id":
+                            class_id,
+
+                        "confidence":
+                            confidence,
+
+                        "x1":
+                            float(box[0]),
+
+                        "y1":
+                            float(box[1]),
+
+                        "x2":
+                            float(box[2]),
+
+                        "y2":
+                            float(box[3]),
+
+                        "raw_index":
+                            raw_index,
+
+                        "raw_iou":
+                            raw_iou,
+
+                        "reference_type":
+                            reference_type,
+
+                        "gt_iou":
+                            gt_iou,
+
+                        "ebpg":
+                            ebpg,
+
+                        "pointing_game":
+                            pointing_game,
+
+                        "deletion_auc":
+                            deletion["auc"],
+
+                        "deletion_normalized_auc":
+                            deletion[
+                                "normalized_auc"
+                            ],
+
+                        "insertion_auc":
+                            insertion["auc"],
+
+                        "insertion_normalized_auc":
+                            insertion[
+                                "normalized_auc"
+                            ],
+                    }
+                )
+
+                total_explanations += 1
+
+                print(
+                    "\nDetecção processada."
+                )
+
+            processed_images += 1
+
+        except Exception as e:
+
+            failed_images += 1
+
+            print(
+                "\nERRO AO PROCESSAR:"
+            )
+
+            print(
+                image_path
+            )
+
+            print(
+                f"{type(e).__name__}: {e}"
+            )
+
+            traceback.print_exc()
+
+    # ========================================================
+    # RESULTADOS
+    # ========================================================
 
     print(
-        f"EBPG: {ebpg:.4f}"
-    )
-
-
-    # ========================================================
-    # DELETION
-    # ========================================================
-
-    print(
-        "Executando Deletion Test..."
-    )
-
-    deletion_result = deletion_test(
-        model=model,
-        image_tensor=x,
-        saliency_map=saliency_map,
-        prediction_index=prediction_index,
-        steps=STEPS
-    )
-
-    deletion_auc = (
-        deletion_result["auc"]
-    )
-
-    deletion_auc_values.append(
-        deletion_auc
+        "\n" + "=" * 70
     )
 
     print(
-        f"Deletion AUC: "
-        f"{deletion_auc:.4f}"
-    )
-
-
-    # ========================================================
-    # INSERTION
-    # ========================================================
-
-    print(
-        "Executando Insertion Test..."
-    )
-
-    insertion_result = insertion_test(
-        model=model,
-        image_tensor=x,
-        saliency_map=saliency_map,
-        prediction_index=prediction_index,
-        steps=STEPS
-    )
-
-    insertion_auc = (
-        insertion_result["auc"]
-    )
-
-    insertion_auc_values.append(
-        insertion_auc
+        "PROCESSAMENTO FINALIZADO"
     )
 
     print(
-        f"Insertion AUC: "
-        f"{insertion_auc:.4f}"
+        "=" * 70
     )
 
-
-    # ========================================================
-    # SALIENCY MAP
-    # ========================================================
-
-    saliency_path = os.path.join(
-        SALIENCY_DIR,
-        f"detection_{detection_id}.png"
+    print(
+        f"Imagens encontradas: "
+        f"{len(image_paths)}"
     )
 
-    save_saliency_map(
-        saliency_map,
-        saliency_path
+    print(
+        f"Imagens processadas: "
+        f"{processed_images}"
     )
 
-
-    # ========================================================
-    # OVERLAY
-    # ========================================================
-
-    overlay_path = os.path.join(
-        OVERLAY_DIR,
-        f"detection_{detection_id}.png"
+    print(
+        f"Imagens com erro: "
+        f"{failed_images}"
     )
 
-    save_overlay(
-        image=original_image,
-        saliency_map=saliency_map,
-        box=box,
-        detection_id=detection_id,
-        confidence=confidence,
-        ebpg=ebpg,
-        path=overlay_path
+    print(
+        f"Total de predições explicadas: "
+        f"{total_explanations}"
     )
 
+    # --------------------------------------------------------
+    # CSV
+    # --------------------------------------------------------
 
-    # ========================================================
-    # CURVAS
-    # ========================================================
+    if all_results:
 
-    curve_path = os.path.join(
-        CURVES_DIR,
-        f"detection_{detection_id}.png"
-    )
+        dataframe = pd.DataFrame(
+            all_results
+        )
 
-    save_deletion_insertion_plot(
-        deletion_result,
-        insertion_result,
-        detection_id,
-        curve_path
-    )
+        csv_path = os.path.join(
+            OUTPUT_DIR,
+            "metrics.csv",
+        )
 
+        dataframe.to_csv(
+            csv_path,
+            index=False,
+        )
 
-    # ========================================================
-    # ARMAZENAR
-    # ========================================================
+        print(
+            f"\nCSV salvo: {csv_path}"
+        )
 
-    results.append({
+        # ----------------------------------------------------
+        # ESTATÍSTICAS
+        # ----------------------------------------------------
 
-        "detection_id":
-            detection_id,
+        print(
+            "\nMÉDIAS"
+        )
 
-        "prediction_index":
-            prediction_index,
+        print(
+            f"EBPG: "
+            f"{dataframe['ebpg'].mean():.6f}"
+        )
 
-        "confidence":
-            confidence,
+        print(
+            f"Pointing Game: "
+            f"{dataframe['pointing_game'].mean():.6f}"
+        )
 
-        "box":
-            box,
+        print(
+            f"Deletion AUC: "
+            f"{dataframe['deletion_auc'].mean():.6f}"
+        )
 
-        "ebpg":
-            ebpg,
+        print(
+            f"Insertion AUC: "
+            f"{dataframe['insertion_auc'].mean():.6f}"
+        )
 
-        "deletion": {
-
-            "auc":
-                deletion_auc,
-
-            "fractions":
-                deletion_result[
-                    "fractions"
-                ].tolist(),
-
-            "scores":
-                deletion_result[
-                    "scores"
+        print(
+            "\n" + dataframe[
+                [
+                    "image",
+                    "detection_index",
+                    "confidence",
+                    "ebpg",
+                    "deletion_auc",
+                    "insertion_auc",
                 ]
-        },
-
-        "insertion": {
-
-            "auc":
-                insertion_auc,
-
-            "fractions":
-                insertion_result[
-                    "fractions"
-                ].tolist(),
-
-            "scores":
-                insertion_result[
-                    "scores"
-                ]
-        }
-    })
-
-
-# ============================================================
-# ESTATÍSTICAS EBPG
-# ============================================================
-
-ebpg_statistics = calculate_statistics(
-    ebpg_values
-)
-
-
-# ============================================================
-# ESTATÍSTICAS DELETION
-# ============================================================
-
-deletion_statistics = calculate_test_statistics(
-    deletion_auc_values
-)
-
-
-# ============================================================
-# ESTATÍSTICAS INSERTION
-# ============================================================
-
-insertion_statistics = calculate_test_statistics(
-    insertion_auc_values
-)
-
-
-# ============================================================
-# RESULTADO FINAL
-# ============================================================
-
-final_statistics = {
-
-    "EBPG":
-        ebpg_statistics,
-
-    "Deletion_AUC":
-        deletion_statistics,
-
-    "Insertion_AUC":
-        insertion_statistics
-}
-
-
-print(
-    "\n\n"
-    + "=" * 70
-)
-
-print(
-    "RESULTADOS ESTATÍSTICOS"
-)
-
-print(
-    "=" * 70
-)
-
-
-# ============================================================
-# EBPG
-# ============================================================
-
-print(
-    "\nEBPG"
-)
-
-for key, value in (
-    ebpg_statistics.items()
-):
-
-    print(
-        f"{key:10s}: {value:.4f}"
-        if isinstance(
-            value,
-            float
+            ].to_string(
+                index=False
+            )
         )
-        else
-        f"{key:10s}: {value}"
-    )
 
+    else:
 
-# ============================================================
-# DELETION
-# ============================================================
-
-print(
-    "\nDeletion AUC"
-)
-
-for key, value in (
-    deletion_statistics.items()
-):
-
-    print(
-        f"{key:10s}: {value:.4f}"
-        if isinstance(
-            value,
-            float
+        print(
+            "\nNenhuma predição foi explicada."
         )
-        else
-        f"{key:10s}: {value}"
-    )
 
 
-# ============================================================
-# INSERTION
-# ============================================================
-
-print(
-    "\nInsertion AUC"
-)
-
-for key, value in (
-    insertion_statistics.items()
-):
-
-    print(
-        f"{key:10s}: {value:.4f}"
-        if isinstance(
-            value,
-            float
-        )
-        else
-        f"{key:10s}: {value}"
-    )
-
-
-# ============================================================
-# SALVAR JSON
-# ============================================================
-
-output = {
-
-    "image":
-        IMAGE_PATH,
-
-    "num_detections":
-        len(detections),
-
-    "detections":
-        results,
-
-    "statistics":
-        final_statistics
-}
-
-
-json_path = os.path.join(
-    OUTPUT_DIR,
-    "results.json"
-)
-
-
-with open(
-    json_path,
-    "w",
-    encoding="utf-8"
-) as f:
-
-    json.dump(
-        output,
-        f,
-        indent=4,
-        ensure_ascii=False
-    )
-
-
-# ============================================================
-# REMOVER HOOKS
-# ============================================================
-
-hooks.remove()
-
-
-print(
-    "\n"
-    + "=" * 70
-)
-
-print(
-    "Experimento concluído."
-)
-
-print(
-    f"Resultados: {OUTPUT_DIR}"
-)
-
-print(
-    f"JSON: {json_path}"
-)
-# ============================================================
-# OBTER SCORE DA DETECÇÃO
-# ============================================================
-
+if __name__ == "__main__":
+    main()
