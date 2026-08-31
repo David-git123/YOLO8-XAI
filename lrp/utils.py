@@ -606,32 +606,6 @@ def compute_lrp(
     raw_detection_index,
     epsilon=1e-6
 ):
-    """
-    Calcula LRP para uma única predição.
-
-    Parameters
-    ----------
-    model : nn.Module
-        model.model da Ultralytics.
-
-    image_tensor : torch.Tensor
-        [1, 3, H, W]
-
-    raw_detection_index : int
-        Índice da predição RAW.
-
-    epsilon : float
-        Estabilizador da regra LRP.
-
-    Returns
-    -------
-    relevance : torch.Tensor
-        Mapa de relevância [1, 3, H, W].
-
-    target_score : torch.Tensor
-        Score utilizado como alvo.
-    """
-
     device = image_tensor.device
 
     target_model = YOLODetectionTarget(
@@ -650,30 +624,24 @@ def compute_lrp(
         )
     )
 
-    # --------------------------------------------------------
-    # Importante:
-    #
-    # A entrada deve requerer gradiente.
-    # --------------------------------------------------------
-
     x = image_tensor.detach().clone()
     x.requires_grad_(True)
 
-    with Gradient(
-        model=target_model,
-        composite=composite
-    ) as attributor:
+    with torch.inference_mode(False):
+        with Gradient(
+            model=target_model,
+            composite=composite
+        ) as attributor:
 
-        output, relevance = attributor(
-            x,
-            torch.ones_like
-        )
+            output, relevance = attributor(
+                x,
+                torch.ones_like
+            )
 
     return (
         relevance.detach(),
         output.detach()
     )
-
 
 # ============================================================
 # RELEVÂNCIA -> SALIÊNCIA
