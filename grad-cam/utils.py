@@ -289,23 +289,23 @@ def generate_gradcam(
 
     hooks.activations = None
     hooks.gradients = None
+    with torch.enable_grad(): 
+        output = forward_model(
+            model,
+            x
+        )
 
-    output = forward_model(
-        model,
-        x
-    )
+        predictions = output[0]
 
-    predictions = output[0]
+        class_scores = predictions[4]
 
-    class_scores = predictions[4]
+        # --------------------------------------------------------
+        # TARGET DA DETECÇÃO
+        # --------------------------------------------------------
 
-    # --------------------------------------------------------
-    # TARGET DA DETECÇÃO
-    # --------------------------------------------------------
-
-    target = class_scores[
-        prediction_index
-    ]
+        target = class_scores[
+            prediction_index
+        ]
 
     # --------------------------------------------------------
     # BACKPROPAGATION
