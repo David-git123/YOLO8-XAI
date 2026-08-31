@@ -6,6 +6,8 @@ from tqdm import tqdm
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+import torch
+import cv2
 
 def load_img(path,input_size):
 
