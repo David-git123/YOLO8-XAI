@@ -606,14 +606,100 @@ def compute_lrp(
     raw_detection_index,
     epsilon=1e-6
 ):
+    """
+    Calcula LRP para uma única predição RAW da YOLOv8.
+    """
+
     device = image_tensor.device
 
-    target_model = YOLODetectionTarget(
+    model = model.to(device)
+    model.eval()
+
+    # --------------------------------------------------------
+    # Entrada normal de autograd
+    # --------------------------------------------------------
+
+    x = image_tensor.detach().clone().to(device)
+    x.requires_grad_(True)
+
+    # --------------------------------------------------------
+    # Target que extrai somente o score da detecção desejada
+    # --------------------------------------------------------
+
+    class YOLOTarget(nn.Module):
+
+        def __init__(self, model, detection_index):
+            super().__init__()
+
+            self.model = model
+            self.detection_index = detection_index
+
+        def forward(self, x):
+
+            # IMPORTANTE:
+            # garantir que esta execução não esteja em
+            # torch.inference_mode()
+
+            with torch.inference_mode(False):
+
+                output = self.model(x)
+
+            if isinstance(output, (tuple, list)):
+                output = output[0]
+
+            if not torch.is_tensor(output):
+                raise RuntimeError(
+                    "A saída da YOLO não é um tensor."
+                )
+
+            # YOLOv8 normalmente retorna [B, 4+nc, N]
+            if output.ndim != 3:
+                raise RuntimeError(
+                    f"Formato RAW inesperado: {output.shape}"
+                )
+
+            # [B, C, N] -> [B, N, C]
+            if output.shape[1] <= 10:
+                output = output.transpose(1, 2)
+
+            if self.detection_index >= output.shape[1]:
+                raise IndexError(
+                    f"Índice RAW {self.detection_index} "
+                    f"fora do intervalo "
+                    f"[0, {output.shape[1] - 1}]"
+                )
+
+            detection = output[
+                0,
+                self.detection_index
+            ]
+
+            if detection.shape[0] < 5:
+                raise RuntimeError(
+                    "A detecção não possui "
+                    "4 coordenadas + score."
+                )
+
+            # Score da classe
+            score = detection[4]
+
+            # IMPORTANTE:
+            # clone() cria um tensor normal fora de qualquer
+            # inference tensor problemático.
+            score = score.clone()
+
+            return score.unsqueeze(0)
+
+    target_model = YOLOTarget(
         model,
         raw_detection_index
     ).to(device)
 
     target_model.eval()
+
+    # --------------------------------------------------------
+    # Zennit
+    # --------------------------------------------------------
 
     composite = EpsilonGammaBox(
         low=0.0,
@@ -624,10 +710,12 @@ def compute_lrp(
         )
     )
 
-    x = image_tensor.detach().clone()
-    x.requires_grad_(True)
+    # --------------------------------------------------------
+    # LRP
+    # --------------------------------------------------------
 
     with torch.inference_mode(False):
+
         with Gradient(
             model=target_model,
             composite=composite
