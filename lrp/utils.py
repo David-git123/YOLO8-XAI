@@ -609,7 +609,38 @@ def compute_lrp(
     """
     Calcula LRP para uma única predição RAW da YOLOv8.
     """
+    print("\n===== DEBUG LRP =====")
 
+    print(
+        "inference_mode:",
+        torch.is_inference_mode_enabled()
+    )
+
+    print(
+        "image is inference tensor:",
+        torch.is_inference(image_tensor)
+    )
+
+    print(
+        "image requires_grad:",
+        image_tensor.requires_grad
+    )
+
+    x = image_tensor.detach().clone()
+
+    print(
+        "x is inference tensor:",
+        torch.is_inference(x)
+    )
+
+    x.requires_grad_(True)
+
+    print(
+        "x requires_grad:",
+        x.requires_grad
+    )
+
+    print("=====================\n")
     device = image_tensor.device
 
     model = model.to(device)
