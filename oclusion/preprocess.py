@@ -169,8 +169,9 @@ def box_iou(box1, box2):
 def explain(
     model,
     inp,
-    masks,
-    batch_size=100
+    masks, 
+    batch_size=100,
+    confidence_threshold = 0.7
 ):
 
     N = masks.shape[0]
@@ -185,6 +186,16 @@ def explain(
     if len(original_detections) == 0:
         raise ValueError(
             "O modelo não encontrou nenhuma detecção."
+        )
+
+    filtered_detections = original_detections[
+        original_detections[:, 4] >= confidence_threshold
+    ]
+
+    if len(filtered_detections) == 0:
+        raise ValueError(
+            f"Nenhuma detecção possui confiança >= "
+            f"{confidence_threshold:.2f}."
         )
 
     D = len(original_detections)

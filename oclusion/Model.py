@@ -8,7 +8,7 @@ class Model:
         self,
         model_path="assets/models/best.pt",
         input_size=(960, 960),
-        conf=0.001
+        conf=0.7
     ):
 
         self.model = YOLO(
