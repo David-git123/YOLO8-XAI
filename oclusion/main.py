@@ -21,7 +21,7 @@ from preprocess import (
 IMAGE_PATH = "/content/TubastraeaZoomOut.jpg"
 MODEL_PATH = "assets/models/best.pt"
 
-INPUT_SIZE = (960, 960)
+INPUT_SIZE = (640, 640)
 
 N = 100
 S = 16
